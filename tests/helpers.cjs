@@ -104,6 +104,8 @@ function harness(entry = "src/plugin.js") {
       if (name === "obsidian") return api;
       if (name === "@codemirror/view") return require("@codemirror/view");
       if (name === "./core") return core;
+      if (name === "./automatic") return require("../src/automatic");
+      if (name === "./storage") return require("../src/storage");
       if (name === "./comparison") return require("../src/comparison");
       if (name === "./updates") return require("../src/updates");
       if (name === "./source-tracking")

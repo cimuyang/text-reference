@@ -18,6 +18,7 @@ async function apply(p, r, selected, mode, expected) {
     quote: selected.quote,
     prefix: selected.prefix,
     suffix: selected.suffix,
+    locator: selected.locator,
     snapshot: mode === "update" ? selected.quote : (r.snapshot ?? r.quote),
     repair: false,
     originalToken: undefined,
@@ -46,6 +47,7 @@ async function apply(p, r, selected, mode, expected) {
       });
     Object.assign(r, next);
     p.fullQuotes?.delete(r.id);
+    p.sourceAnchors?.delete(r.id);
     p.sourceStatus?.delete(r.id);
     p.sourceDrafts?.delete(r.id);
     try {
@@ -80,6 +82,7 @@ async function revert(p, op) {
     for (const key of Object.keys(r))
       if (!Object.hasOwn(op.before, key)) delete r[key];
     Object.assign(r, op.before);
+    p.sourceAnchors?.delete(r.id);
     try {
       await p.save();
     } catch (error) {

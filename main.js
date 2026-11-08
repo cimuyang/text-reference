@@ -5558,6 +5558,42 @@ var require_core = __commonJS({
       return readable(token);
     }
     Object.assign(module2.exports, { visibleToken });
+    function referenceLinks(text) {
+      if (!/[)）]\s*(?:\]\]|\]\()/.test(text)) return [];
+      const starts = [0, ...Array.from(text.matchAll(/\n/g), (m) => m.index + 1)];
+      const ignored = markdown.parse(text, {}).filter((block) => block.type === "fence" || block.type === "code_block").map(({ map: [start, end] }) => {
+        var _a;
+        return [starts[start], (_a = starts[end]) != null ? _a : text.length];
+      });
+      const frontmatter = /^(?:\uFEFF)?---[ \t]*\r?\n[\s\S]*?^---[ \t]*(?:\r?\n|$)/m.exec(text);
+      if ((frontmatter == null ? void 0 : frontmatter.index) === 0) ignored.unshift([0, frontmatter[0].length]);
+      const parts = [];
+      let from = 0;
+      for (const [start, end] of ignored) {
+        if (end <= from) continue;
+        parts.push(text.slice(from, start), text.slice(Math.max(from, start), end).replace(/[^\r\n]/g, " "));
+        from = end;
+      }
+      parts.push(text.slice(from));
+      const pattern = /<!--[^]*?(?:-->|$)|%%[^]*?(?:%%|$)|(`+)(?:(?!\n[ \t\r]*\n)[^])*?\1(?!`)|\\[^\r\n]|!?(?:\[\[([^\[\]|\r\n]+)\|([^\[\]\r\n]+)\]\]|\[((?:\\.|[^\[\]\\\r\n])+)\]\(([^()\s]+)\))/g;
+      const links = [];
+      for (const match of parts.join("").matchAll(pattern)) {
+        const [token, , wikiPath, wikiLabel, , markdownPath] = match;
+        if (!wikiPath && !markdownPath || token.startsWith("!")) continue;
+        let path = (wikiPath != null ? wikiPath : markdownPath).trim();
+        try {
+          if (markdownPath) path = decodeURIComponent(path);
+        } catch (e) {
+          continue;
+        }
+        if (!path || /[#^]/.test(path) || /^(?:[\w+.-]+:|\/\/)/.test(path)) continue;
+        const label = (wikiLabel != null ? wikiLabel : visibleToken(token)).trimEnd();
+        if (label.endsWith("\uFF09") || label.endsWith(")"))
+          links.push({ at: match.index, token, path, label });
+      }
+      return links;
+    }
+    module2.exports.referenceLinks = referenceLinks;
     function recover(text, r) {
       const exact = locate(text, r);
       if (exact.status === "found") {
@@ -5793,12 +5829,17 @@ var require_source_tracking = __commonJS({
         end: range.end
       });
     }
-    function read(p, file) {
-      var _a, _b, _c;
+    function editorDocument(p, file) {
+      var _a, _b;
       for (const view of p.editorViews || [])
         if (((_b = (_a = view.state.field(p.Obsidian.editorInfoField, false)) == null ? void 0 : _a.file) == null ? void 0 : _b.path) === file.path)
-          return Promise.resolve(view.state.doc.toString());
-      (_c = p.sourceReadRequests) != null ? _c : p.sourceReadRequests = /* @__PURE__ */ new Map();
+          return view.state.doc;
+    }
+    function read(p, file) {
+      var _a;
+      const doc = editorDocument(p, file);
+      if (doc) return Promise.resolve(doc.toString());
+      (_a = p.sourceReadRequests) != null ? _a : p.sourceReadRequests = /* @__PURE__ */ new Map();
       if (p.sourceReadRequests.has(file.path))
         return p.sourceReadRequests.get(file.path);
       const promise = Promise.resolve(p.app.vault.read(file));
@@ -5809,6 +5850,73 @@ var require_source_tracking = __commonJS({
       };
       promise.then(done, done);
       return promise;
+    }
+    function previewSource(p, file, path = file.path) {
+      var _a, _b, _c;
+      const cache = (_a = p.previewSources) != null ? _a : p.previewSources = /* @__PURE__ */ new Map();
+      const doc = editorDocument(p, file);
+      const mtime = (_b = file.stat) == null ? void 0 : _b.mtime;
+      let entry = cache.get(path);
+      if (entry && entry.doc === doc && entry.mtime === mtime) {
+        cache.delete(path);
+        cache.set(path, entry);
+        return entry;
+      }
+      if (entry && entry.mtime !== mtime) (_c = p.sourceReadRequests) == null ? void 0 : _c.delete(file.path);
+      entry = {
+        doc,
+        mtime,
+        size: 0,
+        users: 0,
+        ranges: /* @__PURE__ */ new Map(),
+        current: () => {
+          var _a2;
+          return cache.get(path) === entry && editorDocument(p, file) === doc && ((_a2 = file.stat) == null ? void 0 : _a2.mtime) === mtime;
+        },
+        release: () => {
+          entry.users--;
+          if (!entry.users && entry.size > 4e6 && cache.get(path) === entry)
+            cache.delete(path);
+        }
+      };
+      cache.set(path, entry);
+      while (cache.size > 8) cache.delete(cache.keys().next().value);
+      entry.text = read(p, file).then(
+        (text) => {
+          entry.size = text.length;
+          if (!entry.users && entry.size > 4e6 && cache.get(path) === entry)
+            cache.delete(path);
+          let total = [...cache.values()].reduce((n, item) => n + item.size, 0);
+          for (const [key, item] of cache) {
+            if (total <= 4e6) break;
+            if (item === entry) continue;
+            total -= item.size;
+            cache.delete(key);
+          }
+          return text;
+        },
+        (error) => {
+          if (cache.get(path) === entry) cache.delete(path);
+          throw error;
+        }
+      );
+      return entry;
+    }
+    function previewRange(p, entry, text, r, key) {
+      var _a, _b;
+      if (r.automatic) {
+        if ((_a = p.refs) == null ? void 0 : _a.some((saved) => saved.source === r.source)) return resolve(p, text, r);
+        key = JSON.stringify(["syntax", r.quote]);
+      }
+      const anchor2 = (_b = p.sourceAnchors) == null ? void 0 : _b.get(r.id);
+      if ((anchor2 == null ? void 0 : anchor2.text) === text) key += JSON.stringify([anchor2.start, anchor2.end]);
+      if (!entry.ranges.has(key)) {
+        const pending = resolve(p, text, r);
+        entry.ranges.set(key, pending);
+        if (entry.ranges.size > 64) entry.ranges.delete(entry.ranges.keys().next().value);
+        pending.catch(() => entry.ranges.delete(key));
+      }
+      return entry.ranges.get(key);
     }
     function diff(before, after) {
       const changes = [];
@@ -5979,6 +6087,8 @@ var require_source_tracking = __commonJS({
       p.refreshDisplays();
     }
     function reset(p) {
+      var _a;
+      (_a = p.previewSources) == null ? void 0 : _a.clear();
       p.trackingGeneration = (p.trackingGeneration || 0) + 1;
       for (const timer of p.sourceTimers.values()) clearTimeout(timer);
       for (const key of [
@@ -6051,6 +6161,7 @@ var require_source_tracking = __commonJS({
     }
     async function resolve(p, text, r, hash) {
       var _a, _b;
+      if (r.automatic) return resolveAutomatic(p, text, r, hash);
       const anchored = (_a = p.sourceAnchors) == null ? void 0 : _a.get(r.id);
       if (anchored && anchored.source === r.source && anchored.baseQuote === r.quote && anchored.text === text)
         return {
@@ -6080,18 +6191,301 @@ var require_source_tracking = __commonJS({
       const found = locate(p, text, r);
       return found.start !== void 0 && core2.contentSame(text.slice(found.start, found.end), r.quote) ? { ...found, status: "found" } : found;
     }
+    async function resolveAutomatic(p, text, r, hash) {
+      var _a, _b;
+      const pattern = r.quote.split(/\s+/u).map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("\\s+");
+      const search = new RegExp(pattern, "g");
+      const hit = search.exec(text);
+      let exact;
+      if (hit) {
+        search.lastIndex = hit.index + 1;
+        if (search.test(text)) return { status: "ambiguous" };
+        exact = { status: "found", start: hit.index, end: hit.index + hit[0].length };
+      }
+      let known;
+      const label = r.quote.replace(/\s+/gu, " ");
+      for (const saved of p.refs || []) {
+        if (saved.source !== r.source || saved.status === "unused" || core2.readable((_a = saved.snapshot) != null ? _a : saved.quote) !== label)
+          continue;
+        const found = await resolve(p, text, saved, hash);
+        if (found.start === void 0) continue;
+        const other = known != null ? known : exact;
+        if (other && (other.start !== found.start || other.end !== found.end)) {
+          if (known || !exact || found.status !== "found" || exact.start < found.start || exact.end > found.end)
+            return { status: "ambiguous" };
+        }
+        known = { ...found, basis: saved };
+      }
+      return (_b = known != null ? known : exact) != null ? _b : { status: "missing" };
+    }
     module2.exports.resolve = resolve;
+    module2.exports.fingerprint = fingerprint;
+    module2.exports.sourceFile = (p, r) => {
+      var _a, _b;
+      return (_b = p.app.vault.getAbstractFileByPath(r.source)) != null ? _b : r.automatic ? (_a = p.app.metadataCache) == null ? void 0 : _a.getFirstLinkpathDest(r.linkPath, r.target) : null;
+    };
     function invalidate(p, path) {
-      var _a, _b, _c, _d, _e, _f, _g;
-      if (p.refs && !p.refs.some((r) => r.source === path) && !((_a = p.sourceReadRequests) == null ? void 0 : _a.has(path)) && !((_b = p.sourceHashes) == null ? void 0 : _b.has(path)) && !((_c = p.sourceEpochs) == null ? void 0 : _c.has(path)))
+      var _a, _b, _c, _d, _e, _f, _g, _h;
+      (_a = p.previewSources) == null ? void 0 : _a.delete(path);
+      if (p.refs && !p.refs.some((r) => r.source === path) && !((_b = p.sourceReadRequests) == null ? void 0 : _b.has(path)) && !((_c = p.sourceHashes) == null ? void 0 : _c.has(path)) && !((_d = p.sourceEpochs) == null ? void 0 : _d.has(path)))
         return;
-      (_d = p.sourceReadRequests) == null ? void 0 : _d.delete(path);
-      (_e = p.sourceHashes) == null ? void 0 : _e.delete(path);
-      (_f = p.sourceRequests) == null ? void 0 : _f.delete(path);
-      (_g = p.sourceEpochs) != null ? _g : p.sourceEpochs = /* @__PURE__ */ new Map();
+      (_e = p.sourceReadRequests) == null ? void 0 : _e.delete(path);
+      (_f = p.sourceHashes) == null ? void 0 : _f.delete(path);
+      (_g = p.sourceRequests) == null ? void 0 : _g.delete(path);
+      (_h = p.sourceEpochs) != null ? _h : p.sourceEpochs = /* @__PURE__ */ new Map();
       p.sourceEpochs.set(path, (p.sourceEpochs.get(path) || 0) + 1);
     }
     module2.exports.invalidate = invalidate;
+    module2.exports.previewSource = previewSource;
+    module2.exports.previewRange = previewRange;
+  }
+});
+
+// src/automatic.js
+var require_automatic = __commonJS({
+  "src/automatic.js"(exports2, module2) {
+    "use strict";
+    var core2 = require_core();
+    var tracking2 = require_source_tracking();
+    function bindings(p, text, path, includeRepair = false) {
+      var _a, _b;
+      if (!path) return [];
+      const refs = p.refs.filter((r) => r.target === path);
+      for (const r of refs) core2.reconcile(text, r);
+      const saved = core2.managedBindings(refs, text, path);
+      const positions = new Map(saved.map(({ r, at }) => [at, r]));
+      let entry = p.automaticNotes.get(path);
+      if ((entry == null ? void 0 : entry.text) !== text) {
+        clearTimeout(entry == null ? void 0 : entry.timer);
+        entry = { text, links: core2.referenceLinks(text), sources: /* @__PURE__ */ new Set() };
+        p.automaticNotes.set(path, entry);
+        if (p.automaticNotes.size > 32) {
+          const first = p.automaticNotes.keys().next().value;
+          clearTimeout(p.automaticNotes.get(first).timer);
+          p.automaticNotes.delete(first);
+        }
+      }
+      const destinations = /* @__PURE__ */ new Map();
+      const inferred = [];
+      for (const link of entry.links) {
+        const prior = positions.get(link.at);
+        if (prior && !prior.repair) continue;
+        if (!destinations.has(link.path))
+          destinations.set(
+            link.path,
+            p.app.metadataCache.getFirstLinkpathDest(link.path, path)
+          );
+        const file = destinations.get(link.path);
+        if (file && !/\.md$/i.test(file.path)) continue;
+        const name = (_a = file == null ? void 0 : file.basename) != null ? _a : link.path.split("/").at(-1).replace(/\.md$/i, "");
+        const suffix = [`\uFF08${name}\uFF09`, `(${name})`].find(
+          (ending) => link.label.endsWith(ending)
+        );
+        const quote = suffix && link.label.slice(0, -suffix.length).trim();
+        if (!quote) continue;
+        positions.delete(link.at);
+        inferred.push({
+          at: link.at,
+          r: {
+            id: JSON.stringify([path, link.at, link.token]),
+            automatic: true,
+            at: link.at,
+            target: path,
+            source: (_b = file == null ? void 0 : file.path) != null ? _b : link.path,
+            linkPath: link.path,
+            token: link.token,
+            quote,
+            name,
+            reviewId: prior && prior.source === (file == null ? void 0 : file.path) ? prior.id : void 0
+          },
+          file: prior ? void 0 : file
+        });
+      }
+      queue(p, path, entry, inferred);
+      return [
+        ...saved.filter(
+          ({ r, at }) => !r.repair || includeRepair && positions.has(at)
+        ),
+        ...inferred
+      ];
+    }
+    function queue(p, path, entry, inferred) {
+      entry.sources = new Set(inferred.map(({ r }) => r.source));
+      const links = p.settings.notifySourceChanges ? inferred.filter(({ file }) => file) : [];
+      const attempt = JSON.stringify(links.map(({ at, file }) => [at, file.path]));
+      if (entry.attempt === attempt) return;
+      clearTimeout(entry.timer);
+      entry.attempt = attempt;
+      const check = {};
+      entry.check = check;
+      if (!links.length || p.trackingStopped) return;
+      entry.timer = setTimeout(
+        () => p.run(() => verify(p, path, entry, check, links)),
+        250
+      );
+    }
+    async function verify(p, path, entry, check, links) {
+      var _a;
+      const isCurrent = () => !p.trackingStopped && p.settings.notifySourceChanges && p.automaticNotes.get(path) === entry && entry.check === check;
+      if (!isCurrent()) return;
+      const file = p.app.vault.getAbstractFileByPath(path);
+      if (!file) return;
+      const sources = /* @__PURE__ */ new Map();
+      const verified = [];
+      for (const { r, at, file: source } of links) {
+        if (!isCurrent()) return;
+        if (!sources.has(source.path)) {
+          const text2 = await tracking2.read(p, source).catch(() => null);
+          sources.set(source.path, { text: text2 });
+        }
+        const item = sources.get(source.path);
+        if (typeof item.text !== "string") continue;
+        const found = await tracking2.resolve(p, item.text, r, item.hash);
+        if (found.start === void 0) continue;
+        (_a = item.hash) != null ? _a : item.hash = await tracking2.fingerprint(item.text);
+        verified.push(recordAt(r, item.text, found, item.hash, entry.text, at));
+      }
+      if (!verified.length || !isCurrent()) return;
+      const text = await tracking2.read(p, file).catch(() => null);
+      if (text !== entry.text || !isCurrent()) return;
+      const occupied = /* @__PURE__ */ new Set();
+      const uncertain = /* @__PURE__ */ new Set();
+      for (const r of p.refs.filter((r2) => r2.target === path)) {
+        const at = core2.binding(text, r);
+        if (at < 0) uncertain.add(r.token);
+        else occupied.add(at);
+      }
+      const added = verified.filter(
+        (r) => !occupied.has(r.at) && !uncertain.has(r.token) && core2.binding(text, r) === r.at
+      );
+      if (!added.length) return;
+      p.refs.push(...added);
+      p.schedulePersist();
+      if (p.settings.notifySourceChanges)
+        for (const source of new Set(added.map((r) => r.source)))
+          tracking2.schedule(p, source);
+      await p.rebindReading();
+      p.refreshDisplays();
+    }
+    function recordAt(r, source, { start, end, basis }, hash, target, at) {
+      const captured = basis != null ? basis : core2.capture(source, start, end, r.source);
+      const { v, quote, prefix, suffix } = captured;
+      return core2.bind({
+        v,
+        quote,
+        prefix,
+        suffix,
+        source: r.source,
+        name: r.name,
+        snapshot: r.quote,
+        locator: { source: r.source, hash, start, end }
+      }, r.target, r.token, target, at);
+    }
+    async function promote(p, r, source, found) {
+      const file = p.app.vault.getAbstractFileByPath(r.target);
+      if (!file || found.start === void 0) return null;
+      const hash = await tracking2.fingerprint(source);
+      const text = await tracking2.read(p, file);
+      if (text.slice(r.at, r.at + r.token.length) !== r.token) return null;
+      for (const saved of p.refs.filter((x) => x.target === r.target)) {
+        const at = core2.binding(text, saved);
+        if (at === r.at) return saved.source === r.source ? saved : null;
+        if (at < 0 && saved.token === r.token) return null;
+      }
+      const record = recordAt(r, source, found, hash, text, r.at);
+      if (core2.binding(text, record) !== r.at) return null;
+      p.refs.push(record);
+      p.schedulePersist();
+      if (p.settings.notifySourceChanges) tracking2.schedule(p, r.source);
+      await p.rebindReading();
+      p.refreshDisplays();
+      return record;
+    }
+    function invalidate(p, path) {
+      const filename = path.split("/").at(-1);
+      const basename = filename.replace(/\.md$/i, "");
+      let changed = false;
+      for (const entry of p.automaticNotes.values()) {
+        if (!entry.sources.has(path) && !entry.sources.has(filename) && !entry.sources.has(basename))
+          continue;
+        clearTimeout(entry.timer);
+        entry.attempt = null;
+        entry.check = null;
+        changed = true;
+      }
+      return changed;
+    }
+    module2.exports = { bindings, invalidate, promote };
+  }
+});
+
+// src/storage.js
+var require_storage = __commonJS({
+  "src/storage.js"(exports2, module2) {
+    "use strict";
+    var core2 = require_core();
+    function canonicalToken(r) {
+      var _a;
+      const label = ((_a = r.snapshot) != null ? _a : r.quote).replace(/\s+/g, " ").trim();
+      return core2.inlineLink(r.source, label, r.name);
+    }
+    function pack(settings, refs) {
+      const anchors = [];
+      const index = /* @__PURE__ */ new Map();
+      const bindings = refs.map((r) => {
+        const { source, name, quote, prefix, suffix, locator } = r;
+        const anchor = { source, name, quote, prefix, suffix, locator };
+        const key = JSON.stringify(anchor);
+        if (!index.has(key)) {
+          index.set(key, anchors.length);
+          anchors.push(anchor);
+        }
+        const { id, target, at, before, after, repair, originalToken, renameToken, status } = r;
+        return {
+          id,
+          target,
+          anchor: index.get(key),
+          at,
+          before: before || void 0,
+          after: after || void 0,
+          token: r.token === canonicalToken(r) ? void 0 : r.token,
+          snapshot: r.snapshot === quote ? void 0 : r.snapshot,
+          repair: repair || void 0,
+          originalToken,
+          renameToken,
+          status
+        };
+      });
+      return { schemaVersion: 4, settings, anchors, refs: bindings };
+    }
+    function unpack(data) {
+      var _a, _b;
+      if (!Array.isArray(data == null ? void 0 : data.refs)) return [];
+      const valid = (r) => r && [
+        "id",
+        "target",
+        "source",
+        "name",
+        "quote",
+        "prefix",
+        "suffix"
+      ].every((k) => typeof r[k] === "string");
+      if (data.schemaVersion !== 4)
+        return data.refs.filter((r) => valid(r) && typeof r.token === "string" && r.token);
+      const refs = [];
+      for (const binding of data.refs) {
+        if (!binding || !Number.isInteger(binding.anchor) || binding.anchor < 0) continue;
+        const anchor = (_a = data.anchors) == null ? void 0 : _a[binding.anchor];
+        if (!anchor) continue;
+        const { anchor: _, ...target } = binding;
+        const r = { v: 1, before: "", after: "", ...anchor, ...target };
+        if (!valid(r)) continue;
+        (_b = r.token) != null ? _b : r.token = canonicalToken(r);
+        if (typeof r.token === "string" && r.token) refs.push(r);
+      }
+      return refs;
+    }
+    module2.exports = { pack, unpack };
   }
 });
 
@@ -6179,6 +6573,310 @@ var require_comparison = __commonJS({
   }
 });
 
+// src/document-events.js
+var require_document_events = __commonJS({
+  "src/document-events.js"(exports2, module2) {
+    "use strict";
+    var documents = /* @__PURE__ */ new WeakMap();
+    function listen(doc, type, handler, capture = false) {
+      let types = documents.get(doc);
+      if (!types) documents.set(doc, types = /* @__PURE__ */ new Map());
+      const key = type + ":" + capture;
+      let group = types.get(key);
+      if (!group) {
+        group = {
+          handlers: /* @__PURE__ */ new Set(),
+          dispatch: (event) => {
+            for (const fn of [...group.handlers]) if (fn(event) === false) break;
+          }
+        };
+        types.set(key, group);
+        doc.addEventListener(type, group.dispatch, capture);
+      }
+      group.handlers.add(handler);
+      return () => {
+        group.handlers.delete(handler);
+        if (!group.handlers.size) {
+          doc.removeEventListener(type, group.dispatch, capture);
+          types.delete(key);
+        }
+      };
+    }
+    module2.exports = { listen };
+  }
+});
+
+// src/hover.js
+var require_hover = __commonJS({
+  "src/hover.js"(exports2, module2) {
+    "use strict";
+    var tracking2 = require_source_tracking();
+    var { listen } = require_document_events();
+    function position(text, offset) {
+      const prefix = text.slice(0, offset);
+      return { line: prefix.split("\n").length - 1, col: offset - prefix.lastIndexOf("\n") - 1 };
+    }
+    function closePopover(popover) {
+      var _a, _b;
+      if (!popover) return;
+      try {
+        if (typeof popover.hide === "function") popover.hide();
+        else (_a = popover.unload) == null ? void 0 : _a.call(popover);
+      } finally {
+        (_b = popover.hoverEl) == null ? void 0 : _b.remove();
+      }
+    }
+    function install(p, anchor, r) {
+      const doc = anchor.ownerDocument;
+      const win = doc.defaultView;
+      const current = () => r.automatic || !p.refs ? r : p.refs.find((x) => x.id === r.id);
+      let pointer = null, pending = false, generation = 0;
+      let releaseSource, visiblePopup;
+      const contains = (element, target) => Boolean((target == null ? void 0 : target.nodeType) && (element == null ? void 0 : element.contains(target)));
+      const blur = () => {
+        pointer = null;
+        cancel();
+      };
+      function cancel(dispose = false) {
+        generation++;
+        pending = false;
+        if (p.previewClose === cancel) p.previewClose = null;
+        win.removeEventListener("blur", blur);
+        releaseSource == null ? void 0 : releaseSource();
+        releaseSource = void 0;
+        if (dispose) {
+          const popup = visiblePopup;
+          visiblePopup = void 0;
+          closePopover(popup);
+        }
+      }
+      function popupOwner(turn) {
+        let popup;
+        return {
+          get hoverPopover() {
+            return popup != null ? popup : null;
+          },
+          set hoverPopover(next) {
+            if (next === popup) return;
+            if (visiblePopup === popup) visiblePopup = void 0;
+            popup = next;
+            if (turn !== generation) {
+              if (next) queueMicrotask(() => closePopover(next));
+              return;
+            }
+            visiblePopup = next != null ? next : void 0;
+          }
+        };
+      }
+      function request(event) {
+        var _a, _b, _c;
+        if (!pointer || pending || ((_a = visiblePopup == null ? void 0 : visiblePopup.hoverEl) == null ? void 0 : _a.isConnected) || ((_b = anchor.trDragging) == null ? void 0 : _b.call(anchor))) return;
+        (_c = p.previewClose) == null ? void 0 : _c.call(p);
+        p.previewClose = cancel;
+        pending = true;
+        win.addEventListener("blur", blur, { once: true });
+        const turn = ++generation;
+        p.run(async () => {
+          var _a2;
+          if (turn !== generation) return;
+          const reference = current();
+          const file = reference && tracking2.sourceFile(p, reference);
+          if (!file) {
+            cancel();
+            return;
+          }
+          const source = (_a2 = file.path) != null ? _a2 : reference.source;
+          const entry = tracking2.previewSource(p, file, source);
+          entry.users++;
+          releaseSource = entry.release;
+          let text, found;
+          try {
+            text = await entry.text;
+            if (turn !== generation) return;
+            const latest2 = current();
+            if (latest2 && latest2.source === reference.source) {
+              const key = JSON.stringify([latest2.id, latest2.quote, latest2.prefix, latest2.suffix, latest2.locator]);
+              found = await tracking2.previewRange(p, entry, text, { ...latest2, source }, key);
+            }
+          } catch (e) {
+          }
+          if (turn !== generation) return;
+          const latest = current();
+          if (!anchor.isConnected || !latest || latest.source !== reference.source) {
+            cancel();
+            return;
+          }
+          const startLoc = entry.current() && latest.quote === reference.quote && (found == null ? void 0 : found.start) !== void 0 ? position(text, found.start) : void 0;
+          p.app.workspace.trigger("hover-link", {
+            event,
+            source: "text-reference",
+            hoverParent: popupOwner(turn),
+            targetEl: anchor,
+            linktext: source,
+            sourcePath: latest.target,
+            state: startLoc ? { scroll: startLoc.line, startLoc, endLoc: position(text, found.end) } : void 0
+          });
+        });
+      }
+      const move = (event) => {
+        pointer = event;
+        event.stopPropagation();
+        if (event.ctrlKey || event.metaKey) request(event);
+      };
+      const leave = (event) => {
+        if (contains(anchor, event.relatedTarget)) return;
+        pointer = null;
+        cancel();
+      };
+      anchor.addEventListener("mouseover", move);
+      anchor.addEventListener("mousemove", move);
+      anchor.addEventListener("mouseout", leave);
+      const offDown = listen(doc, "keydown", (event) => {
+        if (!pointer || !(event.ctrlKey || event.metaKey || event.key === "Control" || event.key === "Meta"))
+          return;
+        request(new doc.defaultView.MouseEvent("mouseover", {
+          clientX: pointer.clientX,
+          clientY: pointer.clientY,
+          ctrlKey: event.ctrlKey || event.key === "Control",
+          metaKey: event.metaKey || event.key === "Meta"
+        }));
+      }, true);
+      const offUp = listen(doc, "keyup", (event) => {
+        if (!event.ctrlKey && !event.metaKey && p.previewClose === cancel) cancel();
+      }, true);
+      return () => {
+        cancel(true);
+        offDown();
+        offUp();
+        anchor.removeEventListener("mouseover", move);
+        anchor.removeEventListener("mousemove", move);
+        anchor.removeEventListener("mouseout", leave);
+      };
+    }
+    module2.exports = { install };
+  }
+});
+
+// src/interaction.js
+var require_interaction = __commonJS({
+  "src/interaction.js"(exports2, module2) {
+    "use strict";
+    function bind(p, a, r) {
+      const doc = a.ownerDocument, win = doc.defaultView;
+      let down = null, moved = false, held = false;
+      const current = () => r.automatic ? r : p.refs.find((x) => x.id === r.id);
+      const open = (e) => {
+        const reference = current();
+        if (!reference) return;
+        const newTab = e.ctrlKey || e.metaKey;
+        p.run(() => p.open(reference, newTab));
+      };
+      a.removeAttribute("title");
+      a.draggable = false;
+      a.setAttribute("contenteditable", "false");
+      const on = (target, type, fn, options) => {
+        target.addEventListener(type, fn, options);
+        return () => target.removeEventListener(type, fn, options);
+      };
+      const ownsSelection = () => {
+        const s = win.getSelection();
+        if (!s || s.isCollapsed || !s.rangeCount) return false;
+        try {
+          return s.getRangeAt(0).intersectsNode(a);
+        } catch (e) {
+          return false;
+        }
+      };
+      let pointerOff = () => {
+      };
+      const startPointer = () => {
+        pointerOff();
+        const move = require_document_events().listen(
+          doc,
+          "mousemove",
+          (e) => {
+            if (down && Math.hypot(e.clientX - down.x, e.clientY - down.y) > 4)
+              moved = true;
+          },
+          true
+        );
+        const up = require_document_events().listen(doc, "mouseup", () => {
+          down = null;
+          held = ownsSelection();
+          pointerOff();
+        });
+        pointerOff = () => {
+          move();
+          up();
+        };
+      };
+      const listeners = [
+        on(a, "mousedown", (e) => {
+          if (e.button !== 0) return;
+          down = { x: e.clientX, y: e.clientY };
+          moved = false;
+          held = true;
+          startPointer();
+        }),
+        on(a, "click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          if (moved || held || e.shiftKey || ownsSelection()) {
+            moved = false;
+            return;
+          }
+          open(e);
+        }),
+        on(a, "keydown", (e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            open(e);
+          }
+        }),
+        on(a, "contextmenu", (e) => {
+          if (ownsSelection()) return;
+          e.preventDefault();
+          e.stopPropagation();
+          if (current()) p.menu(current(), e, a);
+        }),
+        require_document_events().listen(
+          doc,
+          "copy",
+          (e) => {
+            var _a, _b;
+            if (!ownsSelection()) return;
+            const selection = win.getSelection();
+            const text = selection.toString();
+            const reference = current();
+            const whole = text === a.textContent;
+            if (!whole && !(a.contains(selection.anchorNode) && a.contains(selection.focusNode)))
+              return;
+            if (text && e.clipboardData) {
+              p.pending = whole && reference && !reference.automatic && !reference.repair ? (_b = (_a = p.referenceClipboard) == null ? void 0 : _a.call(p, reference)) != null ? _b : null : null;
+              e.clipboardData.setData("text/plain", whole && (reference == null ? void 0 : reference.token) ? reference.token : text);
+              e.preventDefault();
+              e.stopImmediatePropagation();
+              return false;
+            }
+          },
+          true
+        )
+      ];
+      const removeHover = require_hover().install(p, a, r);
+      a.trDragging = () => Boolean(down);
+      a.trSelection = () => Boolean(down) || ownsSelection();
+      return () => {
+        pointerOff();
+        removeHover();
+        for (const off of listeners) off();
+        delete a.trDragging;
+        delete a.trSelection;
+      };
+    }
+    module2.exports = { bind };
+  }
+});
+
 // src/updates.js
 var require_updates = __commonJS({
   "src/updates.js"(exports2, module2) {
@@ -6195,7 +6893,7 @@ var require_updates = __commonJS({
       ]);
     }
     async function apply(p, r, selected, mode, expected) {
-      var _a, _b, _c, _d, _e, _f;
+      var _a, _b, _c, _d, _e, _f, _g;
       if (!p.refs.includes(r) || signature(r) !== signature(expected))
         throw Object.assign(new Error(p.t("changed")), { code: "target-changed" });
       const next = {
@@ -6203,6 +6901,7 @@ var require_updates = __commonJS({
         quote: selected.quote,
         prefix: selected.prefix,
         suffix: selected.suffix,
+        locator: selected.locator,
         snapshot: mode === "update" ? selected.quote : (_a = r.snapshot) != null ? _a : r.quote,
         repair: false,
         originalToken: void 0
@@ -6225,8 +6924,9 @@ var require_updates = __commonJS({
           });
         Object.assign(r, next);
         (_d = p.fullQuotes) == null ? void 0 : _d.delete(r.id);
-        (_e = p.sourceStatus) == null ? void 0 : _e.delete(r.id);
-        (_f = p.sourceDrafts) == null ? void 0 : _f.delete(r.id);
+        (_e = p.sourceAnchors) == null ? void 0 : _e.delete(r.id);
+        (_f = p.sourceStatus) == null ? void 0 : _f.delete(r.id);
+        (_g = p.sourceDrafts) == null ? void 0 : _g.delete(r.id);
         try {
           await p.save();
         } catch (error) {
@@ -6240,6 +6940,7 @@ var require_updates = __commonJS({
       return operation;
     }
     async function revert(p, op) {
+      var _a;
       const r = p.refs.find((x) => x.id === op.id);
       if (!r || signature(r) !== signature(op.after))
         throw Object.assign(new Error(p.t("changed")), { code: "target-changed" });
@@ -6259,6 +6960,7 @@ var require_updates = __commonJS({
         for (const key of Object.keys(r))
           if (!Object.hasOwn(op.before, key)) delete r[key];
         Object.assign(r, op.before);
+        (_a = p.sourceAnchors) == null ? void 0 : _a.delete(r.id);
         try {
           await p.save();
         } catch (error) {
@@ -6390,512 +7092,13 @@ var require_maintenance = __commonJS({
       if (changed) p.schedulePersist();
     }
     function register(p, r, text) {
-      const at = core2.binding(text, r);
       for (const old of [...p.refs])
-        if (old.target === r.target && core2.binding(text, old) === at)
+        if (old.target === r.target && core2.binding(text, old) === r.at)
           retire(p, old);
       r.updatedAt = Date.now();
       p.refs.push(r);
     }
     module2.exports = { transaction, register };
-  }
-});
-
-// src/document-events.js
-var require_document_events = __commonJS({
-  "src/document-events.js"(exports2, module2) {
-    "use strict";
-    var documents = /* @__PURE__ */ new WeakMap();
-    function listen(doc, type, handler, capture = false) {
-      let types = documents.get(doc);
-      if (!types) documents.set(doc, types = /* @__PURE__ */ new Map());
-      const key = type + ":" + capture;
-      let group = types.get(key);
-      if (!group) {
-        group = {
-          handlers: /* @__PURE__ */ new Set(),
-          dispatch: (event) => {
-            for (const fn of [...group.handlers]) if (fn(event) === false) break;
-          }
-        };
-        types.set(key, group);
-        doc.addEventListener(type, group.dispatch, capture);
-      }
-      group.handlers.add(handler);
-      return () => {
-        group.handlers.delete(handler);
-        if (!group.handlers.size) {
-          doc.removeEventListener(type, group.dispatch, capture);
-          types.delete(key);
-        }
-      };
-    }
-    module2.exports = { listen };
-  }
-});
-
-// src/preview-range.js
-var require_preview_range = __commonJS({
-  "src/preview-range.js"(exports2, module2) {
-    "use strict";
-    var core2 = require_core();
-    function project(root) {
-      var _a, _b;
-      const doc = root.ownerDocument;
-      const walker = doc.createTreeWalker(root, 5);
-      let text = "", previous = null;
-      const positions = [];
-      for (let node; node = walker.nextNode(); ) {
-        if (node.nodeType === 1) {
-          if (node.tagName === "BR" && text && !text.endsWith(" ")) {
-            text += " ";
-            positions.push(null);
-          }
-          continue;
-        }
-        if ((_a = node.parentElement) == null ? void 0 : _a.closest("script,style,button,input,.tr-preview-note"))
-          continue;
-        const block = (_b = node.parentElement) == null ? void 0 : _b.closest(
-          "p,li,h1,h2,h3,h4,h5,h6,pre,td,th,blockquote"
-        );
-        if (previous && block !== previous && text && !text.endsWith(" ")) {
-          text += " ";
-          positions.push(null);
-        }
-        previous = block;
-        for (let i = 0; i < node.data.length; i++) {
-          const c = /\s/.test(node.data[i]) ? " " : node.data[i];
-          if (c === " " && (!text || text.endsWith(" "))) continue;
-          text += c;
-          positions.push({ node, offset: i });
-        }
-      }
-      return { text, positions };
-    }
-    function wholeRange(root, source, found, prepared, projection) {
-      var _a, _b;
-      if (!Number.isInteger(found.start) || !Number.isInteger(found.end) || found.start < 0 || found.end > source.length || found.end <= found.start)
-        return [];
-      const quote = (_a = prepared == null ? void 0 : prepared.quote) != null ? _a : core2.readable(source.slice(found.start, found.end));
-      if (!quote) return [];
-      const full = (_b = prepared == null ? void 0 : prepared.full) != null ? _b : core2.readable(source), sourceAt = full.indexOf(quote);
-      if (sourceAt < 0 || full.indexOf(quote, sourceAt + 1) >= 0) return [];
-      const { text, positions } = projection || project(root);
-      const at = text.indexOf(quote);
-      if (at < 0 || text.indexOf(quote, at + 1) >= 0) return [];
-      const first = positions[at], last = positions[at + quote.length - 1];
-      if (!first || !last) return [];
-      const range = root.ownerDocument.createRange();
-      range.setStart(first.node, first.offset);
-      range.setEnd(last.node, last.offset + 1);
-      return [range];
-    }
-    function ranges(root, source, found, prepared) {
-      var _a;
-      prepared != null ? prepared : prepared = {
-        quote: core2.readable(source.slice(found.start, found.end)),
-        full: core2.readable(source)
-      };
-      const projection = project(root);
-      const whole = wholeRange(root, source, found, prepared, projection);
-      if (whole.length) return whole;
-      if (!Number.isInteger(found.start) || !Number.isInteger(found.end) || found.start < 0 || found.end > source.length || found.end <= found.start)
-        return [];
-      const selected = source.slice(found.start, found.end), parts = selected.split("\n");
-      if (parts.length < 2) return [];
-      let offset = found.start;
-      const result = [];
-      for (const part of parts) {
-        if (part.trim())
-          result.push(
-            ...wholeRange(
-              root,
-              source,
-              { start: offset, end: offset + part.length },
-              {
-                full: (_a = prepared == null ? void 0 : prepared.full) != null ? _a : core2.readable(source),
-                quote: core2.readable(part)
-              },
-              projection
-            )
-          );
-        offset += part.length + 1;
-      }
-      return result;
-    }
-    var counter = 0;
-    function watch(p, popover, source, found) {
-      var _a;
-      const root = popover.hoverEl;
-      if (!root) return () => {
-      };
-      const win = root.ownerDocument.defaultView;
-      const prepared = {
-        quote: core2.readable(source.slice(found.start, found.end)),
-        full: core2.readable(source)
-      };
-      const key = "tr-passage-" + ++counter;
-      const style = root.ownerDocument.createElement("style");
-      style.textContent = "::highlight(" + key + "){background-color:var(--text-highlight-bg, #f4e5b4);color:var(--text-normal);}";
-      root.ownerDocument.head.appendChild(style);
-      let disposed = false, scheduled = false, scrollDone = false;
-      let frame = null;
-      const update = () => {
-        var _a2, _b, _c, _d;
-        scheduled = false;
-        if (disposed) return;
-        const content = root.querySelector(".markdown-preview-view,.markdown-rendered") || root;
-        const hits = ranges(content, source, found, prepared);
-        if (((_a2 = win.CSS) == null ? void 0 : _a2.highlights) && win.Highlight) {
-          if (hits.length) {
-            win.CSS.highlights.set(key, new win.Highlight(...hits));
-            for (const block of root.querySelectorAll(".is-flashing"))
-              block.classList.remove("is-flashing");
-          } else win.CSS.highlights.delete(key);
-        }
-        if (hits.length && !scrollDone) {
-          const element = hits[0].startContainer.parentElement;
-          (_b = element == null ? void 0 : element.scrollIntoView) == null ? void 0 : _b.call(element, { block: "center", inline: "nearest" });
-          scrollDone = true;
-        }
-        const canHighlight = hits.length && ((_c = win.CSS) == null ? void 0 : _c.highlights) && win.Highlight;
-        let note = root.querySelector(".tr-preview-note");
-        if (!canHighlight && ((_d = content.textContent) == null ? void 0 : _d.trim()) && !note) {
-          note = root.ownerDocument.createElement("div");
-          note.className = "tr-preview-note";
-          note.textContent = p.zh === false ? "Context shown; exact text highlighting is unavailable." : "\u5DF2\u663E\u793A\u4E0A\u4E0B\u6587\uFF0C\u6682\u4E0D\u80FD\u7CBE\u786E\u6807\u8BB0\u6587\u5B57\u3002";
-          root.appendChild(note);
-        } else if (canHighlight && note) note.remove();
-      };
-      const observer = new win.MutationObserver(() => {
-        if (scheduled || disposed) return;
-        scheduled = true;
-        if (win.requestAnimationFrame) frame = win.requestAnimationFrame(update);
-        else Promise.resolve().then(update);
-      });
-      observer.observe(root, {
-        childList: true,
-        subtree: true,
-        characterData: true,
-        attributes: true,
-        attributeFilter: ["class"]
-      });
-      update();
-      const cleanup = () => {
-        var _a2, _b, _c, _d;
-        disposed = true;
-        observer.disconnect();
-        if (frame !== null) (_a2 = win.cancelAnimationFrame) == null ? void 0 : _a2.call(win, frame);
-        (_c = (_b = win.CSS) == null ? void 0 : _b.highlights) == null ? void 0 : _c.delete(key);
-        style.remove();
-        (_d = root.querySelector(".tr-preview-note")) == null ? void 0 : _d.remove();
-      };
-      (_a = popover.register) == null ? void 0 : _a.call(popover, cleanup);
-      return cleanup;
-    }
-    function context(source, found) {
-      const max = 16e3;
-      const before = source.lastIndexOf("\n\n", Math.max(0, found.start - 1));
-      const left = before < 0 ? 0 : before + 2;
-      const after = source.indexOf("\n\n", found.end);
-      const right = after < 0 ? source.length : after;
-      let start = source.lastIndexOf("\n\n", Math.max(0, left - 3));
-      start = start < 0 ? 0 : start + 2;
-      const following = source.indexOf("\n\n", right + 2);
-      let end = following < 0 ? source.length : following;
-      if (end - start > max) {
-        start = left;
-        end = Math.min(source.length, start + max);
-      }
-      return {
-        text: source.slice(start, end),
-        range: { start: found.start - start, end: found.end - start },
-        truncated: found.end > end
-      };
-    }
-    module2.exports = { project, ranges, watch, context };
-  }
-});
-
-// src/hover.js
-var require_hover = __commonJS({
-  "src/hover.js"(exports2, module2) {
-    "use strict";
-    var tracking2 = require_source_tracking();
-    var preview = require_preview_range();
-    function install(p, a, r, parent) {
-      const doc = a.ownerDocument;
-      let inside = false, mod = false, version = 0, busy = false, requested = false, timer = null;
-      let stopHighlight = () => {
-      }, watchTimer = null;
-      const current = () => p.refs ? p.refs.find((x) => x.id === r.id) : r;
-      const listen = (target, type, fn) => {
-        if (target === doc)
-          return require_document_events().listen(doc, type, fn);
-        target.addEventListener(type, fn);
-        return () => target.removeEventListener(type, fn);
-      };
-      const live = () => parent.hoverPopover && parent.hoverPopover.state !== 3;
-      function request(event) {
-        var _a;
-        if (!inside || !mod || busy || requested || live() || ((_a = a.trSelection) == null ? void 0 : _a.call(a)))
-          return;
-        const turn = ++version;
-        busy = true;
-        requested = true;
-        p.run(async () => {
-          var _a2, _b, _c, _d, _e;
-          try {
-            const reference = current();
-            if (!reference) return;
-            const stamp = JSON.stringify([
-              reference.source,
-              reference.quote,
-              reference.snapshot,
-              reference.locator
-            ]);
-            const epoch = ((_a2 = p.sourceEpochs) == null ? void 0 : _a2.get(reference.source)) || 0;
-            const file = p.app.vault.getAbstractFileByPath(reference.source);
-            if (!file) {
-              return;
-            }
-            const text = await tracking2.read(p, file), found = await tracking2.resolve(p, text, reference);
-            if (turn !== version || !inside || !mod || !a.isConnected) return;
-            const latest = current();
-            if (!latest || stamp !== JSON.stringify([
-              latest.source,
-              latest.quote,
-              latest.snapshot,
-              latest.locator
-            ]) || epoch !== (((_b = p.sourceEpochs) == null ? void 0 : _b.get(reference.source)) || 0)) {
-              requested = false;
-              return;
-            }
-            if (!["found", "changed"].includes(found.status)) {
-              return;
-            }
-            let attempts = 0;
-            const watchNative = () => {
-              var _a3;
-              if (turn !== version || !inside || !mod || !a.isConnected) return;
-              if ((_a3 = parent.hoverPopover) == null ? void 0 : _a3.hoverEl) {
-                stopHighlight();
-                stopHighlight = preview.watch(p, parent.hoverPopover, text, found);
-                return;
-              }
-              if (++attempts < 40) watchTimer = setTimeout(watchNative, 40);
-            };
-            const position = (offset) => {
-              const prefix = text.slice(0, offset), line2 = prefix.split("\n").length - 1;
-              return { line: line2, col: offset - (prefix.lastIndexOf("\n") + 1) };
-            };
-            const line = text.slice(0, found.start).split("\n").length - 1;
-            const previewEnabled = (_e = (_d = (_c = p.app.internalPlugins) == null ? void 0 : _c.getPluginById) == null ? void 0 : _d.call(_c, "page-preview")) == null ? void 0 : _e.enabled;
-            if (previewEnabled !== false)
-              p.app.workspace.trigger("hover-link", {
-                event,
-                source: "text-reference",
-                hoverParent: parent,
-                targetEl: a,
-                linktext: reference.source,
-                sourcePath: reference.target,
-                state: {
-                  scroll: line,
-                  startLoc: position(found.start),
-                  endLoc: position(found.end)
-                }
-              });
-            watchNative();
-            timer = previewEnabled === true ? null : setTimeout(
-              () => {
-                if (turn !== version || !inside || !mod || !a.isConnected || live() || !p.Obsidian.HoverPopover)
-                  return;
-                const popover = new p.Obsidian.HoverPopover(parent, a, 100);
-                parent.hoverPopover = popover;
-                const body = popover.hoverEl.createDiv({
-                  cls: "markdown-rendered tr-context-preview"
-                });
-                clearTimeout(watchTimer);
-                const context = preview.context(text, found);
-                p.run(async () => {
-                  await p.Obsidian.MarkdownRenderer.render(
-                    p.app,
-                    context.text,
-                    body,
-                    reference.source,
-                    popover
-                  );
-                  if (turn !== version || !inside || !mod || popover.state === 3)
-                    return;
-                  stopHighlight();
-                  stopHighlight = preview.watch(
-                    p,
-                    popover,
-                    context.text,
-                    context.range
-                  );
-                });
-              },
-              previewEnabled === false ? 0 : 500
-            );
-          } finally {
-            busy = false;
-          }
-        });
-      }
-      const enter = (e) => {
-        inside = true;
-        mod = e.ctrlKey || e.metaKey;
-        e.stopPropagation();
-        request(e);
-      };
-      const offs = [
-        listen(a, "mouseover", enter),
-        listen(a, "mousemove", enter),
-        listen(a, "mouseout", (e) => {
-          if (a.contains(e.relatedTarget)) return;
-          inside = false;
-          requested = false;
-          version++;
-          busy = false;
-          clearTimeout(timer);
-          clearTimeout(watchTimer);
-          e.stopPropagation();
-        }),
-        listen(doc, "keydown", (e) => {
-          if (!inside || !(e.key === "Control" || e.key === "Meta" || e.ctrlKey || e.metaKey))
-            return;
-          mod = true;
-          request(e);
-        }),
-        listen(doc, "keyup", (e) => {
-          mod = e.ctrlKey || e.metaKey;
-          if (!mod) {
-            requested = false;
-            version++;
-            busy = false;
-            clearTimeout(timer);
-            clearTimeout(watchTimer);
-          }
-        })
-      ];
-      return () => {
-        var _a;
-        version++;
-        clearTimeout(timer);
-        clearTimeout(watchTimer);
-        for (const off of offs) off();
-        stopHighlight();
-        (_a = parent.hoverPopover) == null ? void 0 : _a.unload();
-      };
-    }
-    module2.exports = { install };
-  }
-});
-
-// src/interaction.js
-var require_interaction = __commonJS({
-  "src/interaction.js"(exports2, module2) {
-    "use strict";
-    function bind(p, a, r) {
-      const doc = a.ownerDocument, win = doc.defaultView;
-      let down = null, moved = false, held = false;
-      const parent = { hoverPopover: null };
-      const current = () => p.refs.find((x) => x.id === r.id);
-      a.removeAttribute("title");
-      a.draggable = false;
-      a.setAttribute("contenteditable", "false");
-      const on = (target, type, fn, options) => {
-        target.addEventListener(type, fn, options);
-        return () => target.removeEventListener(type, fn, options);
-      };
-      const ownsSelection = () => {
-        const s = win.getSelection();
-        if (!s || s.isCollapsed || !s.rangeCount) return false;
-        try {
-          return s.getRangeAt(0).intersectsNode(a);
-        } catch (e) {
-          return false;
-        }
-      };
-      let pointerOff = () => {
-      };
-      const startPointer = () => {
-        pointerOff();
-        const move = require_document_events().listen(
-          doc,
-          "mousemove",
-          (e) => {
-            if (down && Math.hypot(e.clientX - down.x, e.clientY - down.y) > 4)
-              moved = true;
-          },
-          true
-        );
-        const up = require_document_events().listen(doc, "mouseup", () => {
-          down = null;
-          held = ownsSelection();
-          pointerOff();
-        });
-        pointerOff = () => {
-          move();
-          up();
-        };
-      };
-      const listeners = [
-        on(a, "mousedown", (e) => {
-          if (e.button !== 0) return;
-          down = { x: e.clientX, y: e.clientY };
-          moved = false;
-          held = true;
-          startPointer();
-        }),
-        on(a, "click", (e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          if (moved || held || e.shiftKey || ownsSelection()) {
-            moved = false;
-            return;
-          }
-          if (current()) p.run(() => p.open(current(), e.ctrlKey || e.metaKey));
-        }),
-        on(a, "keydown", (e) => {
-          if (e.key === "Enter") {
-            e.preventDefault();
-            if (current()) p.run(() => p.open(current(), e.ctrlKey || e.metaKey));
-          }
-        }),
-        on(a, "contextmenu", (e) => {
-          if (ownsSelection()) return;
-          e.preventDefault();
-          e.stopPropagation();
-          if (current()) p.menu(current(), e, a);
-        }),
-        require_document_events().listen(
-          doc,
-          "copy",
-          (e) => {
-            if (!ownsSelection()) return;
-            const text = win.getSelection().toString();
-            if (text && e.clipboardData) {
-              e.clipboardData.setData("text/plain", text);
-              e.preventDefault();
-              e.stopImmediatePropagation();
-              return false;
-            }
-          },
-          true
-        )
-      ];
-      const removeHover = require_hover().install(p, a, r, parent);
-      a.trSelection = () => Boolean(down) || ownsSelection();
-      return () => {
-        pointerOff();
-        removeHover();
-        for (const off of listeners) off();
-        delete a.trSelection;
-      };
-    }
-    module2.exports = { bind };
   }
 });
 
@@ -6910,7 +7113,7 @@ var require_editor = __commonJS({
       Decoration,
       WidgetType
     } = require("@codemirror/view");
-    function install(p, O2, core2) {
+    function install(p, O2) {
       p.editorViews = /* @__PURE__ */ new Set();
       p.refreshEffect = StateEffect.define();
       class QuoteWidget extends WidgetType {
@@ -6920,6 +7123,8 @@ var require_editor = __commonJS({
           this.r = r;
           this.signature = JSON.stringify([
             r.id,
+            r.source,
+            r.token,
             p.display(r),
             r.name,
             p.fullQuotes.has(r.id) ? 0 : p.settings.limit,
@@ -6935,10 +7140,11 @@ var require_editor = __commonJS({
           return p.settings.layout === "split" ? 1 : 0;
         }
         toDOM(view) {
+          var _a, _b;
           const a = view.dom.ownerDocument.createElement("a");
           a.className = "internal-link";
-          a.href = this.r.source;
-          a.dataset.href = this.r.source;
+          a.href = (_a = this.r.linkPath) != null ? _a : this.r.source;
+          a.dataset.href = (_b = this.r.linkPath) != null ? _b : this.r.source;
           a.tabIndex = 0;
           p.paint(a, this.r);
           this.cleanup = require_interaction().bind(p, a, this.r);
@@ -6953,28 +7159,25 @@ var require_editor = __commonJS({
           return true;
         }
       }
-      function build(state) {
-        var _a, _b;
+      function build(state, previous = state) {
+        var _a, _b, _c, _d;
         const ranges = [];
         if (!state.field(O2.editorLivePreviewField, false)) return Decoration.none;
         const path = (_b = (_a = state.field(O2.editorInfoField, false)) == null ? void 0 : _a.file) == null ? void 0 : _b.path, text = state.doc.toString();
-        for (const { r, at } of core2.activeBindings(p.refs, text, path)) {
-          const selected = [...p.editorViews].some(
-            (v) => [...v.dom.querySelectorAll("[data-reference-id]")].some(
-              (a) => {
-                var _a2;
-                return a.dataset.referenceId === r.id && ((_a2 = a.trSelection) == null ? void 0 : _a2.call(a));
-              }
-            )
-          );
-          if (!selected && state.selection.ranges.some(
-            (s) => s.from <= at + r.token.length && s.to >= at
+        const view = [...p.editorViews].find((v) => v.state === previous);
+        const selected = /* @__PURE__ */ new Set();
+        for (const anchor of (_c = view == null ? void 0 : view.dom.querySelectorAll("[data-reference-id]")) != null ? _c : [])
+          if ((_d = anchor.trSelection) == null ? void 0 : _d.call(anchor)) selected.add(anchor.dataset.referenceId);
+        for (const { r, at } of p.referenceBindings(text, path)) {
+          const end = at + r.token.length;
+          if (!selected.has(r.id) && state.selection.ranges.some(
+            (s) => s.empty ? s.head > at && s.head <= end : s.from < end && s.to > at
           ))
             continue;
           ranges.push(
             Decoration.replace({ widget: new QuoteWidget(r) }).range(
               at,
-              at + r.token.length
+              end
             )
           );
         }
@@ -6996,7 +7199,7 @@ var require_editor = __commonJS({
               (_d = (_c = tr.state.field(O2.editorInfoField, false)) == null ? void 0 : _c.file) == null ? void 0 : _d.path
             );
           }
-          return tr.docChanged || tr.selection || tr.effects.some((e) => e.is(p.refreshEffect)) ? build(tr.state) : old;
+          return tr.docChanged || tr.selection || tr.effects.some((e) => e.is(p.refreshEffect)) ? build(tr.state, tr.startState) : old;
         },
         provide: (f) => Prec.highest(EditorView.decorations.from(f))
       });
@@ -7019,7 +7222,7 @@ var require_editor = __commonJS({
           const at = event.clientX || event.clientY ? view.posAtCoords({ x: event.clientX, y: event.clientY }) : view.state.selection.main.head;
           if (at == null || !view.state.selection.main.empty) return false;
           const path = (_d = (_c = view.state.field(O2.editorInfoField, false)) == null ? void 0 : _c.file) == null ? void 0 : _d.path;
-          const hit = core2.managedBindings(p.refs, view.state.doc.toString(), path).filter((x) => at >= x.at && at < x.at + x.r.token.length);
+          const hit = p.referenceBindings(view.state.doc.toString(), path, true).filter((x) => at >= x.at && at < x.at + x.r.token.length);
           if (hit.length !== 1) return false;
           event.preventDefault();
           p.menu(hit[0].r, event, null);
@@ -7036,6 +7239,8 @@ var require_editor = __commonJS({
 var O = require("obsidian");
 var core = require_core();
 var tracking = require_source_tracking();
+var automatic = require_automatic();
+var storage = require_storage();
 var words = {
   send: ["\u5F15\u7528\u5230", "Reference to"],
   copy: ["\u590D\u5236\u5F15\u7528", "Copy reference"],
@@ -7105,7 +7310,7 @@ var Confirm = class extends O.Modal {
     this.review = review;
   }
   onOpen() {
-    var _a, _b, _c, _d;
+    var _a, _b, _c, _d, _e;
     if (this.review) {
       const old = (_b = (_a = this.review.old) != null ? _a : this.text.split("\n\n")[1]) != null ? _b : "";
       const next = (_c = this.review.next) != null ? _c : this.text.split("\n\n").slice(2).join("\n\n").replace(/^→ /, "");
@@ -7122,6 +7327,10 @@ var Confirm = class extends O.Modal {
       );
     } else
       this.contentEl.createEl("p", { text: this.text, cls: "tr-confirm-text" });
+    if ((_e = this.review) == null ? void 0 : _e.openSource)
+      new O.Setting(this.contentEl).addButton(
+        (b) => b.setButtonText(this.p.zh ? "\u6253\u5F00\u6765\u6E90" : "Open source").onClick(() => this.p.run(() => this.review.openSource(() => this.close())))
+      );
     this.errorEl = this.contentEl.createEl("p", { cls: "tr-inline-error" });
     this.errorEl.hidden = true;
     new O.Setting(this.contentEl).addButton(
@@ -7177,24 +7386,22 @@ var Confirm = class extends O.Modal {
   }
 };
 var Review = class extends O.Modal {
-  constructor(p, r, text) {
+  constructor(p, r, text, verified) {
     super(p.app);
     this.p = p;
     this.r = r;
     this.text = text;
+    this.verified = verified;
   }
   onOpen() {
     this.contentEl.createEl("p", { text: this.text });
+    this.contentEl.createEl("blockquote", { text: this.p.display(this.r) });
     new O.Setting(this.contentEl).addButton(
       (b) => b.setButtonText(this.p.zh ? "\u6253\u5F00\u6765\u6E90" : "Open source").onClick(
-        () => this.p.run(async () => {
-          var _a, _b;
-          const opened = await this.p.open(this.r, false, true);
-          if (opened) {
-            this.close();
-            (_b = (_a = opened.view) == null ? void 0 : _a.editor) == null ? void 0 : _b.focus();
-          }
-        })
+        () => this.p.run(() => this.p.open(this.r, false, {
+          verified: this.verified,
+          onOpened: () => this.close()
+        }))
       )
     );
   }
@@ -7219,7 +7426,9 @@ module.exports = class TextReference extends O.Plugin {
     this.Obsidian = O;
     this.fullQuotes = /* @__PURE__ */ new Set();
     this.readingLinks = /* @__PURE__ */ new Map();
+    this.readingBindings = /* @__PURE__ */ new WeakMap();
     this.readingRoots = /* @__PURE__ */ new Map();
+    this.automaticNotes = /* @__PURE__ */ new Map();
     (_a = this.registerHoverLinkSource) == null ? void 0 : _a.call(this, "text-reference", {
       display: "Text Reference",
       defaultMod: true
@@ -7237,9 +7446,7 @@ module.exports = class TextReference extends O.Plugin {
         limit: (_c = data.limit) != null ? _c : 30
       }
     };
-    this.refs = Array.isArray(data.refs) ? data.refs.filter(
-      (r) => r && typeof r.token === "string" && r.token.length && typeof r.target === "string" && typeof r.source === "string" && typeof r.quote === "string" && typeof r.name === "string" && typeof r.prefix === "string" && typeof r.suffix === "string"
-    ) : [];
+    this.refs = storage.unpack(data);
     this.removedRefs = /* @__PURE__ */ new Map();
     tracking.init(this);
     this.saving = Promise.resolve();
@@ -7273,19 +7480,27 @@ module.exports = class TextReference extends O.Plugin {
         if (event.defaultPrevented || (((_a2 = editor.listSelections) == null ? void 0 : _a2.call(editor).length) || 1) > 1 || !view.file || !this.pending || ((_b2 = event.clipboardData) == null ? void 0 : _b2.getData("text/plain")) !== this.pending.token)
           return;
         event.preventDefault();
-        const r = { ...this.pending.r }, token = this.token(r), at = editor.posToOffset(editor.getCursor("from"));
+        const { r, anchor } = this.pending, token = this.pending.token, at = editor.posToOffset(editor.getCursor("from"));
         editor.replaceSelection(token);
-        require_maintenance().register(
-          this,
-          core.bind(r, view.file.path, token, editor.getValue(), at),
-          editor.getValue()
+        const record = this.registerReference(
+          r,
+          view.file.path,
+          token,
+          editor.getValue(),
+          at
         );
-        this.refreshEditors();
+        if (anchor) this.sourceAnchors.set(record.id, { ...anchor });
+        if (this.settings.notifySourceChanges) tracking.schedule(this, record.source);
         this.run(() => this.save());
       })
     );
     this.registerEvent(
+      this.app.vault.on("create", (file) => this.invalidateAutomatic(file.path))
+    );
+    this.registerEvent(
       this.app.vault.on("rename", (file, old) => {
+        this.invalidateAutomatic(old);
+        this.invalidateAutomatic(file.path);
         tracking.invalidate(this, old);
         tracking.invalidate(this, file.path);
         clearTimeout(this.sourceTimers.get(old));
@@ -7311,6 +7526,7 @@ module.exports = class TextReference extends O.Plugin {
     );
     this.registerEvent(
       this.app.vault.on("delete", (file) => {
+        this.invalidateAutomatic(file.path);
         tracking.invalidate(this, file.path);
         for (const r of [...this.refs])
           if (r.target === file.path) {
@@ -7333,6 +7549,7 @@ module.exports = class TextReference extends O.Plugin {
     );
     this.registerEvent(
       this.app.vault.on("modify", (file) => {
+        this.invalidateAutomatic(file.path);
         tracking.invalidate(this, file.path);
         if (this.settings.notifySourceChanges && this.refs.some((r) => r.source === file.path))
           tracking.schedule(this, file.path);
@@ -7357,42 +7574,20 @@ module.exports = class TextReference extends O.Plugin {
       this.pending = null;
     });
   }
+  referenceBindings(text, path, includeRepair) {
+    return automatic.bindings(this, text, path, includeRepair);
+  }
+  invalidateAutomatic(path) {
+    if (!automatic.invalidate(this, path)) return;
+    clearTimeout(this.automaticRefreshTimer);
+    this.automaticRefreshTimer = setTimeout(() => this.run(async () => {
+      await this.rebindReading();
+      this.refreshDisplays();
+    }), 50);
+  }
   async bindReading(el, ctx) {
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i;
     if (!el.querySelector("a.internal-link")) return;
-    const file = this.app.vault.getAbstractFileByPath(ctx.sourcePath);
-    if (!file) return;
-    const text = await tracking.read(this, file);
-    for (const a of el.querySelectorAll("a.internal-link")) {
-      if (this.readingLinks.has(a)) continue;
-      const source = this.app.metadataCache.getFirstLinkpathDest(
-        a.getAttribute("data-href"),
-        ctx.sourcePath
-      );
-      for (const r2 of this.refs.filter((r3) => r3.target === ctx.sourcePath))
-        core.reconcile(text, r2);
-      const candidates = this.refs.filter(
-        (r2) => {
-          var _a;
-          return r2.status !== "unused" && r2.target === ctx.sourcePath && r2.source === (source == null ? void 0 : source.path) && core.binding(text, r2) >= 0 && [
-            ...r2.repair ? [core.referenceText(r2)] : [],
-            this.display(r2),
-            ((_a = r2.snapshot) != null ? _a : r2.quote).replace(/\r?\n/g, " ")
-          ].some((label) => a.textContent === label + "\uFF08" + r2.name + "\uFF09");
-        }
-      );
-      if (candidates.length !== 1) continue;
-      const r = candidates[0], child = new O.MarkdownRenderChild(a), original = a.textContent;
-      ctx.addChild(child);
-      if (!r.repair) this.paint(a, r);
-      const cleanup = require_interaction().bind(this, a, r);
-      this.readingLinks.set(a, r);
-      child.register(() => {
-        cleanup();
-        this.readingLinks.delete(a);
-        a.textContent = original;
-        a.classList.remove("tr-reference", "tr-body");
-      });
-    }
     if (!this.readingRoots.has(el)) {
       this.readingRoots.set(el, ctx);
       const owner = new O.MarkdownRenderChild(el);
@@ -7406,13 +7601,113 @@ module.exports = class TextReference extends O.Plugin {
         this.readingRoots.delete(el);
       });
     }
+    const path = ctx.sourcePath;
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!file) {
+      for (const a of el.querySelectorAll("a.internal-link"))
+        (_a = this.readingBindings.get(a)) == null ? void 0 : _a.release();
+      return;
+    }
+    const text = await tracking.read(this, file);
+    if (!this.readingRoots.has(el)) return;
+    const bindings = this.referenceBindings(text, path, true);
+    const entry = this.automaticNotes.get(path);
+    const section = (_b = ctx.getSectionInfo) == null ? void 0 : _b.call(ctx, el);
+    let start = 0, end = text.length;
+    if (section) {
+      const lines = (_c = entry.lineStarts) != null ? _c : entry.lineStarts = [0, ...Array.from(text.matchAll(/\n/g), (m) => m.index + 1)];
+      if (lines[section.lineStart] === void 0) return;
+      start = lines[section.lineStart];
+      end = (_d = lines[section.lineEnd + 1]) != null ? _d : text.length;
+    }
+    const key = (source, label) => JSON.stringify([source, label]);
+    const groups = /* @__PURE__ */ new Map();
+    for (const { r, at } of bindings) {
+      if (at < start || at + r.token.length > end) continue;
+      const id = key(r.source, core.visibleToken(r.token));
+      if (!groups.has(id))
+        groups.set(id, { refs: /* @__PURE__ */ new Map(), anchors: [], tokens: /* @__PURE__ */ new Set() });
+      const group = groups.get(id);
+      group.refs.set(at, r);
+      group.tokens.add(r.token);
+    }
+    const syntax = /* @__PURE__ */ new Map();
+    for (const { at, token } of entry.links) {
+      if (at < start || at + token.length > end) continue;
+      if (!syntax.has(token)) syntax.set(token, []);
+      syntax.get(token).push(at);
+    }
+    const anchors = el.querySelectorAll("a.internal-link");
+    for (const a of anchors) {
+      const href = a.getAttribute("data-href");
+      if (!href) continue;
+      const source = this.app.metadataCache.getFirstLinkpathDest(href, path);
+      const label = (_f = (_e = this.readingBindings.get(a)) == null ? void 0 : _e.label) != null ? _f : a.textContent;
+      let group = groups.get(key((_g = source == null ? void 0 : source.path) != null ? _g : href, label));
+      if (!group && !source && href.includes("%")) {
+        try {
+          group = groups.get(key(decodeURIComponent(href), label));
+        } catch (e) {
+        }
+      }
+      group == null ? void 0 : group.anchors.push(a);
+    }
+    const desired = /* @__PURE__ */ new Map();
+    for (const { refs, anchors: anchors2, tokens } of groups.values()) {
+      const offsets = new Set(refs.keys());
+      for (const token of tokens)
+        for (const at of (_h = syntax.get(token)) != null ? _h : []) offsets.add(at);
+      const positions = [...offsets];
+      if (positions.length !== anchors2.length) continue;
+      positions.sort((a, b) => a - b);
+      anchors2.forEach((a, i) => desired.set(a, refs.get(positions[i])));
+    }
+    for (const a of anchors) {
+      const r = desired.get(a);
+      const bound = this.readingBindings.get(a);
+      if (r && (bound == null ? void 0 : bound.id) === r.id && bound.source === r.source && bound.reviewId === r.reviewId && bound.repair === Boolean(r.repair)) continue;
+      if ((_i = a.trSelection) == null ? void 0 : _i.call(a)) continue;
+      bound == null ? void 0 : bound.release();
+      if (!r) continue;
+      const label = a.textContent;
+      const attributes = ["contenteditable", "draggable", "title"].map(
+        (name) => [name, a.getAttribute(name)]
+      );
+      const child = new O.MarkdownRenderChild(a);
+      const cleanup = require_interaction().bind(this, a, r);
+      const release = () => {
+        var _a2;
+        if (((_a2 = this.readingBindings.get(a)) == null ? void 0 : _a2.release) !== release) return;
+        cleanup();
+        this.readingBindings.delete(a);
+        this.readingLinks.delete(a);
+        a.textContent = label;
+        a.classList.remove("tr-reference", "tr-body");
+        delete a.trPaint;
+        for (const [name, value] of attributes)
+          if (value === null) a.removeAttribute(name);
+          else a.setAttribute(name, value);
+      };
+      this.readingBindings.set(a, {
+        id: r.id,
+        source: r.source,
+        reviewId: r.reviewId,
+        repair: Boolean(r.repair),
+        label,
+        release
+      });
+      this.readingLinks.set(a, r);
+      if (!r.repair) this.paint(a, r);
+      child.register(release);
+      ctx.addChild(child);
+    }
   }
   refreshDisplays() {
     var _a;
     this.refreshEditors();
     for (const [a, r] of this.readingLinks || [])
       if (a.isConnected && !((_a = a.trSelection) == null ? void 0 : _a.call(a))) {
-        const current = !r.target ? r : this.refs.find((x) => x.id === r.id);
+        const current = !r.target || r.automatic ? r : this.refs.find((x) => x.id === r.id);
         if (current && !current.repair) this.paint(a, current);
       }
   }
@@ -7421,32 +7716,28 @@ module.exports = class TextReference extends O.Plugin {
     this.persistTimer = setTimeout(() => this.run(() => this.persist()), 250);
   }
   onunload() {
+    var _a;
+    (_a = this.previewClose) == null ? void 0 : _a.call(this, true);
     clearTimeout(this.persistTimer);
+    clearTimeout(this.automaticRefreshTimer);
+    for (const entry of this.automaticNotes.values()) clearTimeout(entry.timer);
+    this.automaticNotes.clear();
     this.trackingStopped = true;
     tracking.reset(this);
     this.persist();
   }
-  async save() {
+  async rebindReading() {
     for (const [el, ctx] of this.readingRoots)
       if (el.isConnected) await this.bindReading(el, ctx);
+  }
+  async save() {
+    await this.rebindReading();
     this.refreshDisplays();
     return this.persist();
   }
   persist() {
     tracking.prune(this);
-    const value = JSON.parse(
-      JSON.stringify({
-        schemaVersion: 3,
-        settings: this.settings,
-        refs: this.refs.map((r) => {
-          const out = { ...r };
-          delete out.limit;
-          delete out.layout;
-          if (out.snapshot === out.quote) delete out.snapshot;
-          return out;
-        })
-      })
-    );
+    const value = JSON.parse(JSON.stringify(storage.pack(this.settings, this.refs)));
     this.saving = this.saving.catch(() => {
     }).then(() => this.saveData(value));
     return this.saving;
@@ -7473,17 +7764,32 @@ module.exports = class TextReference extends O.Plugin {
   }
   display(r) {
     var _a;
-    return core.readable((_a = r.snapshot) != null ? _a : r.quote);
+    return r.automatic ? r.quote : core.readable((_a = r.snapshot) != null ? _a : r.quote);
   }
   refreshEditors() {
     for (const view of this.editorViews || [])
       view.dispatch({ effects: this.refreshEffect.of(null) });
   }
   async copy(editor, view) {
-    const r = this.selection(editor, view), token = this.token(r);
+    const r = this.selection(editor, view);
+    const token = this.token(r);
     await navigator.clipboard.writeText(token);
     this.pending = { r, token };
     new O.Notice(this.t("copied"), 1500);
+  }
+  referenceClipboard(r) {
+    const { v, source, name, quote, snapshot, prefix, suffix, locator } = r;
+    return {
+      r: { v, source, name, quote, snapshot, prefix, suffix, locator },
+      token: r.token,
+      anchor: this.sourceAnchors.get(r.id)
+    };
+  }
+  registerReference(r, path, token, text, at) {
+    const record = core.bind(r, path, token, text, at);
+    require_maintenance().register(this, record, text);
+    this.refreshEditors();
+    return record;
   }
   async send(editor, view) {
     const r = this.selection(editor, view);
@@ -7498,9 +7804,7 @@ module.exports = class TextReference extends O.Plugin {
           after = text + (text.endsWith("\n") ? "" : "\n") + token;
           return after;
         });
-        const record = core.bind(r, file.path, token, after, at);
-        require_maintenance().register(this, record, after);
-        this.refreshEditors();
+        const record = this.registerReference(r, file.path, token, after, at);
         await this.save();
         const message = document.createDocumentFragment();
         message.append(this.t("done") + " ");
@@ -7561,9 +7865,11 @@ module.exports = class TextReference extends O.Plugin {
       });
   }
   menu(r, event, a) {
+    var _a;
     const menu = new O.Menu();
+    const review = r.reviewId ? (_a = this.refs.find((x) => x.id === r.reviewId)) != null ? _a : r : r;
     menu.addItem(
-      (i) => i.setTitle(this.zh ? "\u6838\u5BF9\u539F\u6587\u2026" : "Review source\u2026").setIcon("scan-text").onClick(() => this.run(() => this.reviewSource(r)))
+      (i) => i.setTitle(this.zh ? "\u6838\u5BF9\u539F\u6587\u2026" : "Review source\u2026").setIcon("scan-text").onClick(() => this.run(() => this.reviewSource(review)))
     );
     menu.addItem(
       (i) => i.setTitle(
@@ -7577,33 +7883,41 @@ module.exports = class TextReference extends O.Plugin {
     );
     menu.showAtMouseEvent(event);
   }
-  async open(r, newTab, quiet = false) {
-    var _a, _b;
-    const file = this.app.vault.getAbstractFileByPath(r.source);
+  async open(r, newTab, { verified, onOpened } = {}) {
+    var _a, _b, _c, _d, _e;
+    const file = tracking.sourceFile(this, r);
     if (!file) {
+      if (!onOpened && r.automatic && this.app.workspace.openLinkText)
+        return this.app.workspace.openLinkText(r.linkPath, r.target, newTab);
       new O.Notice(this.t("missing"));
       return;
     }
-    const found = await tracking.resolve(
-      this,
-      await tracking.read(this, file),
-      r
-    ), leaf = !newTab && ((_b = (_a = this.app.workspace).getLeavesOfType) == null ? void 0 : _b.call(_a, "markdown").find((l) => {
+    if (r.automatic && file.path !== r.source) r = { ...r, source: file.path };
+    const workspace = this.app.workspace;
+    const leaf = !newTab && ((_a = workspace.getLeavesOfType) == null ? void 0 : _a.call(workspace, "markdown").find((l) => {
       var _a2, _b2;
       return ((_b2 = (_a2 = l.view) == null ? void 0 : _a2.file) == null ? void 0 : _b2.path) === r.source;
-    })) || this.app.workspace.getLeaf(newTab ? "tab" : false);
-    await leaf.openFile(file, { state: { mode: "source" } });
-    if (!["found", "changed"].includes(found.status)) {
-      if (!quiet) new O.Notice(this.t("missing"));
-      return leaf;
+    })) || workspace.getLeaf(newTab ? "tab" : false);
+    await leaf.openFile(file, { active: true, state: { mode: "source" } });
+    await ((_b = leaf.loadIfDeferred) == null ? void 0 : _b.call(leaf));
+    onOpened == null ? void 0 : onOpened();
+    await ((_c = workspace.revealLeaf) == null ? void 0 : _c.call(workspace, leaf));
+    const view = leaf.view;
+    const editor = view instanceof O.MarkdownView && ((_d = view.file) == null ? void 0 : _d.path) === file.path ? view.editor : null;
+    if (editor) {
+      const text = editor.getValue();
+      const found = (verified == null ? void 0 : verified.text) === text ? verified : await tracking.resolve(this, text, r);
+      if (leaf.view === view && ((_e = view.file) == null ? void 0 : _e.path) === file.path && view.editor === editor && editor.getValue() === text && found.start !== void 0) {
+        const from = editor.offsetToPos(found.start);
+        const to = editor.offsetToPos(found.end);
+        editor.setSelection(from, to);
+        editor.scrollIntoView({ from, to }, true);
+        editor.focus();
+        return { leaf, located: true };
+      }
     }
-    if (leaf.view instanceof O.MarkdownView) {
-      const e = leaf.view.editor, from = e.offsetToPos(found.start), to = e.offsetToPos(found.end);
-      e.setSelection(from, to);
-      e.scrollIntoView({ from, to }, true);
-      e.focus();
-    }
-    return leaf;
+    new O.Notice(this.zh ? "\u5DF2\u6253\u5F00\u6765\u6E90\uFF0C\u6682\u65E0\u6CD5\u786E\u5B9A\u539F\u53E5\u4F4D\u7F6E\u3002" : "Source opened, but the passage could not be located.");
+    return { leaf, located: false };
   }
   async change(r, fn) {
     const fail = () => Object.assign(new Error(this.t("changed")), { code: "target-changed" });
@@ -7680,12 +7994,13 @@ module.exports = class TextReference extends O.Plugin {
     return tracking.check(this, file);
   }
   async reviewSource(r) {
-    if (!this.refs.includes(r)) throw Error(this.t("changed"));
-    const file = this.app.vault.getAbstractFileByPath(r.source);
+    if (!r.automatic && !this.refs.includes(r)) throw Error(this.t("changed"));
+    const file = tracking.sourceFile(this, r);
     if (!file) {
-      new O.Notice(this.t("missing"));
+      new Review(this, r, this.t("missing")).open();
       return;
     }
+    if (r.automatic && file.path !== r.source) r = { ...r, source: file.path };
     const text = await tracking.read(this, file);
     const draft = this.sourceDrafts.get(r.id);
     if ((draft == null ? void 0 : draft.source) === r.source && draft.text === text && draft.quote !== r.quote) {
@@ -7694,11 +8009,18 @@ module.exports = class TextReference extends O.Plugin {
     }
     const found = await tracking.resolve(this, text, r);
     if (found.status === "changed" || r.repair && found.status === "found") {
+      if (r.automatic) {
+        const saved = await automatic.promote(this, r, text, found);
+        if (!saved) throw Error(this.t("changed"));
+        r = saved;
+      }
       await this.confirmReference(
         r,
         {
           source: r.source,
           text,
+          start: found.start,
+          end: found.end,
           quote: text.slice(found.start, found.end),
           prefix: text.slice(Math.max(0, found.start - 64), found.start),
           suffix: text.slice(found.end, found.end + 64)
@@ -7710,17 +8032,26 @@ module.exports = class TextReference extends O.Plugin {
     new Review(
       this,
       r,
-      found.status === "found" ? this.zh ? "\u539F\u6587\u672A\u53D8\u5316\u3002" : "Source is unchanged." : this.zh ? "\u6682\u65F6\u65E0\u6CD5\u786E\u5B9A\u539F\u6587\u8303\u56F4\uFF0C\u5DF2\u4FDD\u7559\u6458\u5F55\u3002\u9700\u8981\u66F4\u6362\u65F6\uFF0C\u8BF7\u91CD\u65B0\u590D\u5236\u5F15\u7528\u3002" : "Cannot determine passage. Snapshot preserved. Copy a new reference to replace it."
+      found.status === "found" ? this.zh ? "\u539F\u6587\u672A\u53D8\u5316\u3002" : "Source is unchanged." : this.zh ? "\u6682\u65F6\u65E0\u6CD5\u786E\u5B9A\u539F\u6587\u8303\u56F4\uFF0C\u5DF2\u4FDD\u7559\u6458\u5F55\u3002\u9700\u8981\u66F4\u6362\u65F6\uFF0C\u8BF7\u91CD\u65B0\u590D\u5236\u5F15\u7528\u3002" : "Cannot determine passage. Snapshot preserved. Copy a new reference to replace it.",
+      found.start === void 0 ? void 0 : { ...found, text }
     ).open();
   }
   async confirmReference(r, selected, mode = "update") {
     var _a;
+    const expected = { ...r };
     const file = this.app.vault.getAbstractFileByPath(r.source);
     if (!file || selected.source !== r.source) throw Error(this.t("changed"));
     const sourceText = await tracking.read(this, file);
     if (selected.text !== void 0 ? selected.text !== sourceText : core.locate(sourceText, selected).status !== "found")
       throw Error(this.t("changed"));
-    const expected = { ...r };
+    if (Number.isInteger(selected.start) && Number.isInteger(selected.end) && sourceText.slice(selected.start, selected.end) === selected.quote) {
+      selected = { ...selected, locator: {
+        source: r.source,
+        start: selected.start,
+        end: selected.end,
+        hash: await tracking.fingerprint(sourceText)
+      } };
+    }
     new Confirm(
       this,
       (this.zh ? mode === "update" ? "\u66F4\u65B0\u6B64\u5904\u5F15\u6587\uFF1F" : "\u4EC5\u4FEE\u590D\u4F4D\u7F6E\uFF0C\u4FDD\u7559\u73B0\u6709\u6458\u5F55\uFF1F" : mode === "update" ? "Update this reference?" : "Repair location and keep the snapshot?") + "\n\n" + this.display(r) + "\n\n\u2192 " + core.readable(selected.quote),
@@ -7769,7 +8100,11 @@ module.exports = class TextReference extends O.Plugin {
       },
       {
         old: r.repair ? core.referenceText(r) : (_a = r.snapshot) != null ? _a : r.quote,
-        next: selected.quote
+        next: selected.quote,
+        openSource: (onOpened) => this.open(r, false, {
+          verified: selected.locator ? { ...selected.locator, text: sourceText } : void 0,
+          onOpened
+        })
       }
     ).open();
   }
@@ -7824,24 +8159,15 @@ module.exports = class TextReference extends O.Plugin {
     new O.Notice(this.t("done"));
   }
   installEditor() {
-    require_editor().install(this, O, core);
+    require_editor().install(this, O);
   }
   async onExternalSettingsChange() {
     await this.saving;
     const data = await this.loadData();
     if (!data || !Array.isArray(data.refs)) return;
-    this.refs = data.refs.filter(
-      (r) => r && typeof r.id === "string" && !this.removedRefs.has(r.id) && [
-        "token",
-        "source",
-        "target",
-        "quote",
-        "name",
-        "prefix",
-        "suffix"
-      ].every((k) => typeof r[k] === "string")
-    );
+    this.refs = storage.unpack(data).filter((r) => !this.removedRefs.has(r.id));
     tracking.reset(this);
+    await this.rebindReading();
     this.refreshDisplays();
     if (this.settings.notifySourceChanges) await tracking.checkAll(this);
   }
@@ -7895,7 +8221,7 @@ var Settings = class extends O.PluginSettingTab {
     p.readingLinks.set(example, sample);
     e.createEl("p", {
       cls: "tr-help",
-      text: p.zh ? "\u9009\u4E2D\u6587\u5B57\uFF0C\u53F3\u952E\u590D\u5236\u5F15\u7528\u540E\u7C98\u8D34\uFF1B\u6216\u7528\u5F15\u7528\u5230\u76F4\u63A5\u6DFB\u52A0\u3002\nCtrl\uFF08Mac \u7528 Cmd\uFF09\uFF0B\u60AC\u505C\u9884\u89C8\u4E0A\u4E0B\u6587\uFF1B\u5355\u51FB\u8DF3\u8F6C\uFF0C\u62D6\u52A8\u9009\u5B57\u3002\n\u53F3\u952E\u5F15\u6587\u2192\u6838\u5BF9\u539F\u6587\uFF0C\u5BF9\u6BD4\u540E\u786E\u8BA4\u66F4\u65B0\u3002\n\u663E\u793A\u8BBE\u7F6E\u5373\u65F6\u5E94\u7528\u4E8E\u5DF2\u6709\u5F15\u7528\u3002\u6765\u6E90\u7B14\u8BB0\u4FDD\u6301\u4E0D\u53D8\uFF1B\u8DE8\u8BBE\u5907\u8BF7\u540C\u6B65\u63D2\u4EF6\u6570\u636E\u3002" : "Select text, copy a reference and paste; or use Reference to.\nCtrl/Cmd + hover previews context; click navigates; drag selects text.\nRight-click a reference \u2192 Review source to compare and update.\nDisplay settings apply to existing references. Source notes stay untouched; sync plugin data across devices."
+      text: p.zh ? "\u9009\u4E2D\u6587\u5B57\uFF0C\u53F3\u952E\u590D\u5236\u5F15\u7528\u540E\u7C98\u8D34\uFF1B\u6216\u7528\u5F15\u7528\u5230\u76F4\u63A5\u6DFB\u52A0\u3002\n\u8F93\u5165\u6216\u7C98\u8D34 [[\u7B14\u8BB0|\u5F15\u6587\uFF08\u7B14\u8BB0\uFF09]] \u4F1A\u81EA\u52A8\u5E94\u7528\u5F15\u7528\u6837\u5F0F\u3002\nCtrl\uFF08Mac \u7528 Cmd\uFF09\uFF0B\u60AC\u505C\u9884\u89C8\u4E0A\u4E0B\u6587\uFF1B\u5355\u51FB\u8DF3\u8F6C\uFF0C\u62D6\u52A8\u9009\u5B57\u3002\n\u53F3\u952E\u5F15\u6587\u2192\u6838\u5BF9\u539F\u6587\uFF0C\u5BF9\u6BD4\u540E\u786E\u8BA4\u66F4\u65B0\u3002\n\u663E\u793A\u8BBE\u7F6E\u5373\u65F6\u5E94\u7528\u4E8E\u5DF2\u6709\u5F15\u7528\u3002\u6765\u6E90\u7B14\u8BB0\u4FDD\u6301\u4E0D\u53D8\uFF1B\u8DE8\u8BBE\u5907\u8BF7\u540C\u6B65\u63D2\u4EF6\u6570\u636E\u3002" : "Select text, copy a reference and paste; or use Reference to.\nTyping or pasting [[Note|Passage (Note)]] applies reference styling automatically.\nCtrl/Cmd + hover previews context; click navigates; drag selects text.\nRight-click a reference \u2192 Review source to compare and update.\nDisplay settings apply to existing references. Source notes stay untouched; sync plugin data across devices."
     });
     new O.Setting(e).setName(p.zh ? "\u590D\u5236\u5F15\u7528\u5FEB\u6377\u952E" : "Copy reference shortcut").setDesc(p.hotkeyLabel()).addButton(
       (b) => b.setButtonText(p.zh ? "\u81EA\u5B9A\u4E49" : "Customize").onClick(() => p.customizeHotkey())
@@ -7908,7 +8234,7 @@ var Settings = class extends O.PluginSettingTab {
         tracking.reset(p);
         p.refreshDisplays();
         p.run(async () => {
-          await p.persist();
+          await p.save();
           if (value) await tracking.checkAll(p, true);
         });
       })

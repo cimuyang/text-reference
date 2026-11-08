@@ -148,11 +148,12 @@ test("tracking toggle stops checks and resuming backfills state without persiste
     h.p.saveData = async (value) => (data = value);
     await h.p.persist();
     assert.deepEqual(Object.keys(data).sort(), [
+      "anchors",
       "refs",
       "schemaVersion",
       "settings",
     ]);
-    assert.equal(data.refs[0].quote, h.r.quote);
+    assert.equal(data.anchors[data.refs[0].anchor].quote, h.r.quote);
   } finally {
     h.cleanup();
   }
@@ -194,7 +195,7 @@ test("real CodeMirror state extension tracks source transactions independently o
     h.cleanup();
   }
 });
-test("native hotkeys expose exactly copy and send; repair is contextual", async () => {
+test("commands expose copy and send; recognition is automatic", async () => {
   const h = harness(),
     commands = [];
   h.p.addCommand = (c) => commands.push(c.id);

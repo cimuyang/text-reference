@@ -10,6 +10,7 @@ test("single click navigates; dragging selects and copies only visible text; one
   const r = {
     source: "源.md",
     target: "目标.md",
+    token: "[[源.md|省略号后面还有完整摘录（源）]]",
     quote: "原句",
     prefix: "",
     suffix: "",
@@ -78,6 +79,9 @@ test("single click navigates; dragging selects and copies only visible text; one
   doc.dispatchEvent(event);
   assert.equal(copied, "见引");
   assert.equal(event.defaultPrevented, true);
+  range.selectNodeContents(a);
+  doc.dispatchEvent(event);
+  assert.equal(copied, r.token);
   cleanup();
   dom.window.close();
 });

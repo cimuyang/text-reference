@@ -72,7 +72,7 @@ test("save failure preserves undo and can retry persistence without rewriting te
     let saved;
     h.p.saveData = async (d) => (saved = d);
     await h.p.persist();
-    assert.equal(saved.refs[0].token, h.r.token);
+    assert.equal(require("../src/storage").unpack(saved)[0].token, h.r.token);
     assert.equal(h.contents.get(h.target.path), value);
     await updates.revert(h.p, op);
     assert.equal(h.r.quote, op.before.quote);
@@ -162,11 +162,10 @@ test("open source closes Review only after successful navigation", async () => {
   try {
     await h.p.reviewSource(h.r);
     const modal = h.modals[0];
-    let callback,
-      closed = 0,
-      focused = 0;
+    let callback;
+    const steps = [];
     modal.contentEl = { createEl() {} };
-    modal.close = () => closed++;
+    modal.close = () => steps.push("close");
     h.api.Setting = class {
       addButton(fn) {
         fn({
@@ -182,21 +181,28 @@ test("open source closes Review only after successful navigation", async () => {
       }
     };
     modal.onOpen();
-    h.p.open = async () => undefined;
-    await callback();
-    assert.equal(closed, 0);
-    h.p.open = async () => ({
-      view: {
-        editor: {
-          focus() {
-            focused++;
-          },
-        },
+    const view = new h.api.MarkdownView();
+    view.file = h.source;
+    const actual = "新增一行\n" + h.contents.get(h.source.path);
+    view.editor = {
+      getValue: () => actual,
+      offsetToPos: (offset) => offset,
+      setSelection(from, to) {
+        assert.equal(actual.slice(from, to), h.r.quote);
+        steps.push("select");
       },
-    });
+      scrollIntoView() { steps.push("scroll"); },
+      focus() { steps.push("focus"); },
+    };
+    const leaf = {
+      view: {},
+      async openFile() { steps.push("open"); },
+      async loadIfDeferred() { steps.push("load"); this.view = view; },
+    };
+    h.p.app.workspace.getLeaf = () => leaf;
+    h.p.app.workspace.revealLeaf = async () => steps.push("reveal");
     await callback();
-    assert.equal(closed, 1);
-    assert.equal(focused, 1);
+    assert.deepEqual(steps, ["open", "load", "close", "reveal", "select", "scroll", "focus"]);
   } finally {
     clean(h);
   }

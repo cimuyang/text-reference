@@ -135,6 +135,169 @@ test("render-before-metadata update restores preview and menu immediately, inclu
   }
 });
 
+test("reading view binds identical references separately when records arrive after render", async () => {
+  const h = harness();
+  await h.p.onload();
+  h.p.settings.notifySourceChanges = false;
+  const d = dom();
+  const root = d.window.document.querySelector("main");
+  const children = [];
+  try {
+    const r = { ...h.p.selection(h.editor, { file: h.source }), name: "日志" };
+    const token = h.p.token(r);
+    const text = "第一条 " + token + " 和第二条 " + token;
+    h.contents.set(h.target.path, text);
+    const anchors = [0, 1].map(() => {
+      const a = root.createEl("a", { cls: "internal-link", text: core.visibleToken(token) });
+      a.dataset.href = h.source.path;
+      return a;
+    });
+    await h.p.processor(root, {
+      sourcePath: h.target.path,
+      getSectionInfo: () => ({ lineStart: 0, lineEnd: 0 }),
+      addChild: (c) => children.push(c),
+    });
+    assert.ok(anchors.every((a) => a.classList.contains("tr-reference")));
+    assert.ok(anchors.every((a) => h.p.readingLinks.get(a)?.automatic));
+    const first = core.bind(r, h.target.path, token, text, text.indexOf(token));
+    const second = core.bind(r, h.target.path, token, text, text.lastIndexOf(token));
+    h.p.loadData = async () => ({ refs: [first, second] });
+    await h.p.onExternalSettingsChange();
+    assert.deepEqual(anchors.map((a) => h.p.readingLinks.get(a)?.id), [first.id, second.id]);
+    h.p.loadData = async () => ({ refs: [second] });
+    await h.p.onExternalSettingsChange();
+    assert.ok(anchors[0].classList.contains("tr-reference"));
+    assert.ok(h.p.readingLinks.get(anchors[0])?.automatic);
+    assert.equal(h.p.readingLinks.get(anchors[1])?.id, second.id);
+  } finally {
+    for (const c of children.reverse()) c.cleanup?.();
+    h.p.onunload();
+    d.window.close();
+  }
+});
+
+test("a pasted reading reference opens, previews, and reviews before background verification", async () => {
+  const h = harness();
+  await h.p.onload();
+  h.p.settings.notifySourceChanges = false;
+  const d = dom();
+  const root = d.window.document.querySelector("main");
+  const children = [];
+  const pending = [];
+  const selected = [];
+  const hover = [];
+  const menu = new Map();
+  h.p.run = (fn) => {
+    const action = Promise.resolve().then(fn);
+    pending.push(action);
+    return action;
+  };
+  h.api.Menu = class {
+    addItem(build) {
+      const item = {
+        setTitle(title) { this.title = title; return this; },
+        setIcon() { return this; },
+        onClick(action) { menu.set(this.title, action); return this; },
+      };
+      build(item);
+    }
+    showAtMouseEvent() {}
+  };
+  const view = new h.api.MarkdownView();
+  view.file = h.source;
+  view.editor = {
+    getValue: () => h.contents.get(h.source.path),
+    offsetToPos: (offset) => offset,
+    setSelection: (...range) => selected.push(range),
+    scrollIntoView() {},
+    focus() {},
+  };
+  h.p.app.workspace.getLeaf = () => ({ view, openFile: async () => {} });
+  h.p.app.workspace.trigger = (type, event) => hover.push(event);
+  h.p.app.internalPlugins = { getPluginById: () => ({ enabled: true }) };
+  const token = "[[日志.md|第一行 第二行（日志）]]";
+  const source = "上文\n第一行\r\n第二行\n下文";
+  h.contents.set(h.source.path, source);
+  // The same token in code must not displace the actual anchor.
+  h.contents.set(h.target.path, "`" + token + "` " + token);
+  const a = root.createEl("a", { cls: "internal-link", text: core.visibleToken(token) });
+  a.dataset.href = h.source.path;
+  try {
+    await h.p.processor(root, {
+      sourcePath: h.target.path,
+      addChild: (child) => children.push(child),
+    });
+    assert.ok(a.classList.contains("tr-reference"));
+    assert.equal(h.p.refs.length, 0);
+    const fire = (type, options = {}) => a.dispatchEvent(
+      new d.window.MouseEvent(type, { bubbles: true, cancelable: true, ...options }),
+    );
+    fire("click");
+    await pending.at(-1);
+    assert.deepEqual(selected, [[3, 11]]);
+    fire("mouseover", { ctrlKey: true });
+    await pending.at(-1);
+    assert.equal(hover[0].state.startLoc.line, 1);
+    assert.equal(hover[0].state.endLoc.line, 2);
+    fire("contextmenu");
+    assert.ok(menu.has("显示全文"));
+    await menu.get("核对原文…")();
+    assert.equal(h.modals[0].text, "原文未变化。");
+    assert.equal(h.p.refs.length, 0);
+  } finally {
+    for (const child of children.reverse()) child.cleanup?.();
+    h.p.onunload();
+    d.window.close();
+  }
+});
+
+test("ordinary whole-reference copy preserves the selected occurrence of repeated text", async () => {
+  const h = harness();
+  await h.p.onload();
+  h.p.settings.notifySourceChanges = false;
+  const d = dom();
+  const root = d.window.document.querySelector("main");
+  const children = [];
+  const quote = "重复原句。";
+  const source = "第一处 " + quote + " 第二处 " + quote + " 结束";
+  const at = source.lastIndexOf(quote);
+  const r = { ...core.capture(source, at, at + quote.length, h.source.path), name: h.source.basename };
+  const token = h.p.token(r);
+  h.contents.set(h.source.path, source);
+  h.contents.set(h.target.path, token);
+  h.p.refs.push(core.bind(r, h.target.path, token, token, 0));
+  const a = root.createEl("a", { cls: "internal-link", text: core.visibleToken(token) });
+  a.dataset.href = h.source.path;
+  try {
+    await h.p.processor(root, {
+      sourcePath: h.target.path,
+      addChild: (child) => children.push(child),
+    });
+    const range = d.window.document.createRange();
+    range.selectNodeContents(a);
+    d.window.getSelection().addRange(range);
+    const copy = new d.window.Event("copy", { bubbles: true, cancelable: true });
+    let clipboard;
+    copy.clipboardData = { setData: (_, text) => { clipboard = text; } };
+    a.dispatchEvent(copy);
+    assert.equal(clipboard, token);
+    const paste = { clipboardData: { getData: () => clipboard }, preventDefault() {} };
+    h.handlers["editor-paste"](paste, {
+      getCursor: () => 0,
+      posToOffset: () => 0,
+      replaceSelection: () => {},
+      getValue: () => clipboard,
+    }, { file: { path: "C.md" } });
+    const copied = h.p.refs.find((x) => x.target === "C.md");
+    const located = await require("../src/source-tracking").resolve(h.p, source, copied);
+    assert.equal(located.start, at);
+  } finally {
+    for (const child of children.reverse()) child.cleanup?.();
+    h.p.onunload();
+    d.window.close();
+  }
+});
+
 test("metadata-before-render binds the latest record and uses current identity after record reload", async () => {
   const h = harness();
   await h.p.onload();

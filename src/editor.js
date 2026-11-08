@@ -6,7 +6,7 @@ const {
   Decoration,
   WidgetType,
 } = require("@codemirror/view");
-function install(p, O, core) {
+function install(p, O) {
   p.editorViews = new Set();
   p.refreshEffect = StateEffect.define();
   class QuoteWidget extends WidgetType {
@@ -15,6 +15,8 @@ function install(p, O, core) {
       this.r = r;
       this.signature = JSON.stringify([
         r.id,
+        r.source,
+        r.token,
         p.display(r),
         r.name,
         p.fullQuotes.has(r.id) ? 0 : p.settings.limit,
@@ -32,8 +34,8 @@ function install(p, O, core) {
     toDOM(view) {
       const a = view.dom.ownerDocument.createElement("a");
       a.className = "internal-link";
-      a.href = this.r.source;
-      a.dataset.href = this.r.source;
+      a.href = this.r.linkPath ?? this.r.source;
+      a.dataset.href = this.r.linkPath ?? this.r.source;
       a.tabIndex = 0;
       p.paint(a, this.r);
       this.cleanup = require("./interaction").bind(p, a, this.r);
@@ -47,28 +49,28 @@ function install(p, O, core) {
       return true;
     }
   }
-  function build(state) {
+  function build(state, previous = state) {
     const ranges = [];
     if (!state.field(O.editorLivePreviewField, false)) return Decoration.none;
     const path = state.field(O.editorInfoField, false)?.file?.path,
       text = state.doc.toString();
-    for (const { r, at } of core.activeBindings(p.refs, text, path)) {
-      const selected = [...p.editorViews].some((v) =>
-        [...v.dom.querySelectorAll("[data-reference-id]")].some(
-          (a) => a.dataset.referenceId === r.id && a.trSelection?.(),
-        ),
-      );
+    const view = [...p.editorViews].find((v) => v.state === previous);
+    const selected = new Set();
+    for (const anchor of view?.dom.querySelectorAll("[data-reference-id]") ?? [])
+      if (anchor.trSelection?.()) selected.add(anchor.dataset.referenceId);
+    for (const { r, at } of p.referenceBindings(text, path)) {
+      const end = at + r.token.length;
       if (
-        !selected &&
+        !selected.has(r.id) &&
         state.selection.ranges.some(
-          (s) => s.from <= at + r.token.length && s.to >= at,
+          (s) => s.empty ? s.head > at && s.head <= end : s.from < end && s.to > at,
         )
       )
         continue;
       ranges.push(
         Decoration.replace({ widget: new QuoteWidget(r) }).range(
           at,
-          at + r.token.length,
+          end,
         ),
       );
     }
@@ -92,7 +94,7 @@ function install(p, O, core) {
       return tr.docChanged ||
         tr.selection ||
         tr.effects.some((e) => e.is(p.refreshEffect))
-        ? build(tr.state)
+        ? build(tr.state, tr.startState)
         : old;
     },
     provide: (f) => Prec.highest(EditorView.decorations.from(f)),
@@ -118,8 +120,8 @@ function install(p, O, core) {
           : view.state.selection.main.head;
       if (at == null || !view.state.selection.main.empty) return false;
       const path = view.state.field(O.editorInfoField, false)?.file?.path;
-      const hit = core
-        .managedBindings(p.refs, view.state.doc.toString(), path)
+      const hit = p
+        .referenceBindings(view.state.doc.toString(), path, true)
         .filter((x) => at >= x.at && at < x.at + x.r.token.length);
       if (hit.length !== 1) return false;
       event.preventDefault();

@@ -37,13 +37,17 @@ function anchor(p, text, r, range) {
   });
 }
 
-function read(p, file) {
+function editorDocument(p, file) {
   for (const view of p.editorViews || [])
     if (
       view.state.field(p.Obsidian.editorInfoField, false)?.file?.path ===
       file.path
     )
-      return Promise.resolve(view.state.doc.toString());
+      return view.state.doc;
+}
+function read(p, file) {
+  const doc = editorDocument(p, file);
+  if (doc) return Promise.resolve(doc.toString());
   p.sourceReadRequests ??= new Map();
   if (p.sourceReadRequests.has(file.path))
     return p.sourceReadRequests.get(file.path);
@@ -55,6 +59,68 @@ function read(p, file) {
   };
   promise.then(done, done);
   return promise;
+}
+function previewSource(p, file, path = file.path) {
+  const cache = (p.previewSources ??= new Map());
+  const doc = editorDocument(p, file);
+  const mtime = file.stat?.mtime;
+  let entry = cache.get(path);
+  if (entry && entry.doc === doc && entry.mtime === mtime) {
+    cache.delete(path);
+    cache.set(path, entry);
+    return entry;
+  }
+  if (entry && entry.mtime !== mtime) p.sourceReadRequests?.delete(file.path);
+  entry = {
+    doc, mtime, size: 0, users: 0, ranges: new Map(),
+    current: () =>
+      cache.get(path) === entry &&
+      editorDocument(p, file) === doc &&
+      file.stat?.mtime === mtime,
+    release: () => {
+      entry.users--;
+      if (!entry.users && entry.size > 4_000_000 && cache.get(path) === entry)
+        cache.delete(path);
+    },
+  };
+  cache.set(path, entry);
+  while (cache.size > 8) cache.delete(cache.keys().next().value);
+  entry.text = read(p, file).then(
+    (text) => {
+      entry.size = text.length;
+      if (!entry.users && entry.size > 4_000_000 && cache.get(path) === entry)
+        cache.delete(path);
+      let total = [...cache.values()].reduce((n, item) => n + item.size, 0);
+      for (const [key, item] of cache) {
+        if (total <= 4_000_000) break;
+        if (item === entry) continue;
+        total -= item.size;
+        cache.delete(key);
+      }
+      return text;
+    },
+    (error) => {
+      if (cache.get(path) === entry) cache.delete(path);
+      throw error;
+    },
+  );
+  return entry;
+}
+function previewRange(p, entry, text, r, key) {
+  if (r.automatic) {
+    // Existing references can supply new evidence independently of this file.
+    if (p.refs?.some((saved) => saved.source === r.source)) return resolve(p, text, r);
+    key = JSON.stringify(["syntax", r.quote]);
+  }
+  const anchor = p.sourceAnchors?.get(r.id);
+  if (anchor?.text === text) key += JSON.stringify([anchor.start, anchor.end]);
+  if (!entry.ranges.has(key)) {
+    const pending = resolve(p, text, r);
+    entry.ranges.set(key, pending);
+    if (entry.ranges.size > 64) entry.ranges.delete(entry.ranges.keys().next().value);
+    pending.catch(() => entry.ranges.delete(key));
+  }
+  return entry.ranges.get(key);
 }
 function diff(before, after) {
   const changes = [];
@@ -251,6 +317,7 @@ async function checkAll(p, notify = false) {
   p.refreshDisplays();
 }
 function reset(p) {
+  p.previewSources?.clear();
   p.trackingGeneration = (p.trackingGeneration || 0) + 1;
   for (const timer of p.sourceTimers.values()) clearTimeout(timer);
   for (const key of [
@@ -323,6 +390,7 @@ async function fingerprint(text) {
   ).join("");
 }
 async function resolve(p, text, r, hash) {
+  if (r.automatic) return resolveAutomatic(p, text, r, hash);
   const anchored = p.sourceAnchors?.get(r.id);
   if (
     anchored &&
@@ -373,9 +441,49 @@ async function resolve(p, text, r, hash) {
     ? { ...found, status: "found" }
     : found;
 }
+async function resolveAutomatic(p, text, r, hash) {
+  // The inline label folds line breaks into spaces. Search the source without
+  // losing its offsets, and reject overlapping or repeated matches.
+  const pattern = r.quote.split(/\s+/u)
+    .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+    .join("\\s+");
+  const search = new RegExp(pattern, "g");
+  const hit = search.exec(text);
+  let exact;
+  if (hit) {
+    search.lastIndex = hit.index + 1;
+    if (search.test(text)) return { status: "ambiguous" };
+    exact = { status: "found", start: hit.index, end: hit.index + hit[0].length };
+  }
+  let known;
+  const label = r.quote.replace(/\s+/gu, " ");
+  for (const saved of p.refs || []) {
+    if (saved.source !== r.source || saved.status === "unused" ||
+        core.readable(saved.snapshot ?? saved.quote) !== label)
+      continue;
+    const found = await resolve(p, text, saved, hash);
+    if (found.start === undefined) continue;
+    const other = known ?? exact;
+    if (other && (other.start !== found.start || other.end !== found.end)) {
+      // An existing selection may include Markdown wrappers around this hit.
+      if (known || !exact || found.status !== "found" ||
+          exact.start < found.start || exact.end > found.end)
+        return { status: "ambiguous" };
+    }
+    known = { ...found, basis: saved };
+  }
+  return known ?? exact ?? { status: "missing" };
+}
 module.exports.resolve = resolve;
+module.exports.fingerprint = fingerprint;
+module.exports.sourceFile = (p, r) =>
+  p.app.vault.getAbstractFileByPath(r.source) ??
+  (r.automatic
+    ? p.app.metadataCache?.getFirstLinkpathDest(r.linkPath, r.target)
+    : null);
 
 function invalidate(p, path) {
+  p.previewSources?.delete(path);
   if (
     p.refs &&
     !p.refs.some((r) => r.source === path) &&
@@ -391,3 +499,5 @@ function invalidate(p, path) {
   p.sourceEpochs.set(path, (p.sourceEpochs.get(path) || 0) + 1);
 }
 module.exports.invalidate = invalidate;
+module.exports.previewSource = previewSource;
+module.exports.previewRange = previewRange;

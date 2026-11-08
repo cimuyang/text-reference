@@ -4,6 +4,45 @@ const { EditorState } = require("@codemirror/state");
 const core = require("../src/core");
 const m = require("../src/maintenance");
 const { harness } = require("./helpers.cjs");
+test("compact migration shares verified anchors and preserves independent duplicate occurrences", async () => {
+  const h = harness();
+  const tracking = require("../src/source-tracking");
+  const storage = require("../src/storage");
+  const quote = "很长的重复引文。".repeat(20);
+  const source = "前文\n" + quote + "\n中间\n" + quote + "\n后文";
+  const hash = await tracking.fingerprint(source);
+  const starts = [source.indexOf(quote), source.lastIndexOf(quote)];
+  const token = core.inlineLink(h.source.path, quote, h.source.basename);
+  const make = (start, path) => core.bind({
+    ...core.capture(source, start, start + quote.length, h.source.path),
+    name: h.source.basename,
+    locator: { source: h.source.path, start, end: start + quote.length, hash },
+  }, path, token, token, 0);
+  const legacy = {
+    schemaVersion: 3,
+    settings: { notifySourceChanges: false },
+    refs: [make(starts[0], "B.md"), make(starts[0], "C.md"), make(starts[1], "D.md")],
+  };
+  h.p.loadData = async () => legacy;
+  await h.p.onload();
+  let saved;
+  h.p.saveData = async (data) => { saved = data; };
+  await h.p.persist();
+  assert.equal(saved.schemaVersion, 4);
+  assert.equal(saved.anchors.length, 2);
+  assert.equal(saved.refs[0].anchor, saved.refs[1].anchor);
+  assert.ok(JSON.stringify(saved).length < JSON.stringify(legacy).length);
+  h.p.loadData = async () => saved;
+  await h.p.onExternalSettingsChange();
+  const restored = storage.unpack(saved);
+  assert.deepEqual(h.p.refs.map((r) => r.id), legacy.refs.map((r) => r.id));
+  for (const [i, record] of restored.entries()) {
+    assert.equal(record.token, token);
+    assert.equal((await tracking.resolve(h.p, source, record)).start, starts[i === 2 ? 1 : 0]);
+  }
+  h.p.onunload();
+});
+
 async function setup() {
   const h = harness();
   await h.p.onload();

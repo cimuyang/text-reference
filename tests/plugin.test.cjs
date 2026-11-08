@@ -166,10 +166,98 @@ test("reading DOM renders one inline native link, complete source and unload res
   assert.ok(a.querySelector(".tr-newline"));
   assert.ok(a.classList.contains("tr-body"));
   assert.equal(h.contents.get(h.target.path), token);
-  children[0].cleanup();
+  for (const child of children.reverse()) child.cleanup();
   assert.equal(a.textContent, full);
   assert.ok(!a.classList.contains("tr-reference"));
   dom.window.close();
+});
+
+test("automatic links render immediately and only a unique original is registered", { timeout: 3000 }, async () => {
+  const h = harness();
+  await h.p.onload();
+  h.contents.set(h.source.path, "重复句。唯一原句。重复句。");
+  const unique = "[[日志.md|唯一原句。(日志)]]";
+  const ambiguous = "[[日志.md|重复句。（日志）]]";
+  const missing = "[[其他笔记|保留的摘录（其他笔记）]]";
+  const ordinary = "[[日志.md|普通别名（别处）]]";
+  const text = [unique, ambiguous, missing, ordinary].join("\n");
+  h.contents.set(h.target.path, text);
+  const saved = new Promise((resolve) => { h.p.schedulePersist = resolve; });
+  const rendered = h.p.referenceBindings(text, h.target.path);
+  assert.deepEqual(rendered.map(({ r }) => r.token), [unique, ambiguous, missing]);
+  assert.ok(rendered.every(({ r }) => r.automatic));
+  assert.equal(h.p.refs.length, 0);
+  await saved;
+  assert.equal(h.p.refs.length, 1);
+  assert.equal(h.p.refs[0].token, unique);
+  assert.equal(h.p.refs[0].locator.start, 4);
+  assert.equal(h.contents.get(h.target.path), text);
+  assert.equal(h.writes.length, 0);
+  h.p.onunload();
+});
+
+test("with tracking disabled, a syntax link locates its source without a stored record", async () => {
+  const h = harness();
+  await h.p.onload();
+  h.p.settings.notifySourceChanges = false;
+  const quote = "要引用的一句话。";
+  const token = "[[日志.md|" + quote + "（日志）]]";
+  h.contents.set(h.target.path, token);
+  const [{ r }] = h.p.referenceBindings(token, h.target.path);
+  assert.ok(r.automatic);
+  const source = h.contents.get(h.source.path);
+  const found = await require("../src/source-tracking").resolve(h.p, source, r);
+  assert.equal(found.start, source.indexOf(quote));
+  assert.equal(h.p.automaticNotes.get(h.target.path).timer, undefined);
+  assert.equal(h.p.refs.length, 0);
+  h.p.onunload();
+});
+
+test("a pasted copy of an already changed source can be compared and updated independently", async () => {
+  const h = harness();
+  await h.p.onload();
+  h.p.settings.notifySourceChanges = false;
+  const original = "固定的前文。原来的句子。固定的后文。";
+  const old = "原来的句子。";
+  const changed = "后来改过的句子。";
+  const captured = {
+    ...core.capture(original, original.indexOf(old), original.indexOf(old) + old.length, h.source.path),
+    name: h.source.basename,
+  };
+  const token = h.p.token(captured);
+  const previous = core.bind(captured, "B.md", token, token, 0);
+  h.p.refs.push(previous);
+  h.contents.set(h.source.path, original.replace(old, changed));
+  h.contents.set(h.target.path, token);
+  const [{ r }] = h.p.referenceBindings(token, h.target.path);
+  await h.p.reviewSource(r);
+  const modal = h.modals.at(-1);
+  assert.equal(modal.review.old, old);
+  assert.equal(modal.review.next, changed);
+  await modal.action();
+  assert.equal(h.contents.get(h.target.path), h.p.token({ ...captured, snapshot: changed }));
+  assert.equal(previous.token, token);
+  assert.equal(h.contents.get(h.source.path), original.replace(old, changed));
+  h.p.onunload();
+});
+
+test("stale automatic verification cannot register a removed link", async () => {
+  const h = harness();
+  await h.p.onload();
+  const token = "[[日志.md|要引用的一句话。（日志）]]";
+  h.contents.set(h.target.path, token);
+  h.p.referenceBindings(token, h.target.path);
+  h.contents.set(h.target.path, "已经删除");
+  const check = h.p.automaticNotes.get(h.target.path);
+  await new Promise((resolve) => {
+    h.p.run = async (fn) => {
+      await fn();
+      resolve();
+    };
+    assert.ok(check.timer);
+  });
+  assert.equal(h.p.refs.length, 0);
+  h.p.onunload();
 });
 
 test("release bundle loads without local source files and copies clean reference", async () => {

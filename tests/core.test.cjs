@@ -1,6 +1,29 @@
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const c = require("../src/core");
+test("automatic syntax ignores non-rendered links and preserves real offsets", () => {
+  const wiki = "[[目录/日志.md|一段话 (日志)]]";
+  const fallback = c.inlineLink("目录/日志.md", "包含 [方括号]", "日志");
+  const text = [
+    "---", "value: '" + wiki + "'", "---", "",
+    "```md", wiki, "```", "",
+    "    " + wiki, "",
+    "`inline " + wiki + "`",
+    "%% " + wiki, "仍在注释内 " + wiki + " %%",
+    "<!-- " + wiki + " -->",
+    "!" + wiki,
+    "\\" + wiki,
+    "[[日志#标题|一段话（日志）]]",
+    "",
+    "> " + wiki,
+    fallback,
+  ].join("\r\n");
+  const links = c.referenceLinks(text);
+  assert.deepEqual(links.map((r) => r.token), [wiki, fallback]);
+  assert.equal(links[0].at, text.lastIndexOf(wiki));
+  assert.equal(links[1].label, "包含 [方括号]（日志）");
+});
+
 const make = (text, start = 0, end = text.length) =>
   c.capture(text, start, end, "日志.md", { layout: "inline", limit: 30 });
 test("capture never changes input and preserves exact selection including Unicode", () => {

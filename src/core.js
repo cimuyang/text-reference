@@ -249,6 +249,44 @@ function visibleToken(token) {
 }
 Object.assign(module.exports, { visibleToken });
 
+function referenceLinks(text) {
+  if (!/[)）]\s*(?:\]\]|\]\()/.test(text)) return [];
+  const starts = [0, ...Array.from(text.matchAll(/\n/g), (m) => m.index + 1)];
+  const ignored = markdown.parse(text, {})
+    .filter((block) => block.type === "fence" || block.type === "code_block")
+    .map(({ map: [start, end] }) => [starts[start], starts[end] ?? text.length]);
+  const frontmatter = /^(?:\uFEFF)?---[ \t]*\r?\n[\s\S]*?^---[ \t]*(?:\r?\n|$)/m.exec(text);
+  if (frontmatter?.index === 0) ignored.unshift([0, frontmatter[0].length]);
+  // Preserve offsets while hiding blocks that cannot contain live links.
+  const parts = [];
+  let from = 0;
+  for (const [start, end] of ignored) {
+    if (end <= from) continue;
+    parts.push(text.slice(from, start), text.slice(Math.max(from, start), end).replace(/[^\r\n]/g, " "));
+    from = end;
+  }
+  parts.push(text.slice(from));
+  const pattern =
+    /<!--[^]*?(?:-->|$)|%%[^]*?(?:%%|$)|(`+)(?:(?!\n[ \t\r]*\n)[^])*?\1(?!`)|\\[^\r\n]|!?(?:\[\[([^\[\]|\r\n]+)\|([^\[\]\r\n]+)\]\]|\[((?:\\.|[^\[\]\\\r\n])+)\]\(([^()\s]+)\))/g;
+  const links = [];
+  for (const match of parts.join("").matchAll(pattern)) {
+    const [token, , wikiPath, wikiLabel, , markdownPath] = match;
+    if ((!wikiPath && !markdownPath) || token.startsWith("!")) continue;
+    let path = (wikiPath ?? markdownPath).trim();
+    try {
+      if (markdownPath) path = decodeURIComponent(path);
+    } catch {
+      continue;
+    }
+    if (!path || /[#^]/.test(path) || /^(?:[\w+.-]+:|\/\/)/.test(path)) continue;
+    const label = (wikiLabel ?? visibleToken(token)).trimEnd();
+    if (label.endsWith("）") || label.endsWith(")"))
+      links.push({ at: match.index, token, path, label });
+  }
+  return links;
+}
+module.exports.referenceLinks = referenceLinks;
+
 function recover(text, r) {
   const exact = locate(text, r);
   if (exact.status === "found") {

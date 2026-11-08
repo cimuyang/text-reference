@@ -40,7 +40,7 @@ test("separate external edits outside and inside quote can recover from stable n
   const range = core.recover(edited, record);
   assert.equal(range.status, "changed");
 });
-test("reference menu has two explicit items; source menu has no hidden repair action", async () => {
+test("reference menu offers review and full text; source menu stays focused", async () => {
   const h = harness();
   await h.p.onload();
   const items = [];
@@ -93,5 +93,5 @@ test('comparison renders snapshot and source with explicit update controls',asyn
  proto.createEl=function(tag,o={}){const e=this.ownerDocument.createElement(tag);e.textContent=o.text||'';this.appendChild(e);return e;};proto.appendText=function(s){this.appendChild(this.ownerDocument.createTextNode(s));};
  const h=harness();await h.p.onload();const record={...r,name:'日志',id:'modal',target:h.target.path,token:'old'};h.p.refs=[record];const text=before.replace('中间','新中间');h.contents.set(h.source.path,text);const found=core.recover(text,r);await h.p.confirmReference(record,{source:r.source,text,quote:text.slice(found.start,found.end),prefix:r.prefix,suffix:r.suffix});
  const buttons=[];h.api.Setting=class{addButton(fn){const b={setButtonText(t){buttons.push(t);return this;},setCta(){return this;},onClick(){return this;}};fn(b);return this;}};
- const modal=h.modals[0];modal.contentEl=dom.window.document.querySelector('main');modal.onOpen();assert.ok(modal.contentEl.querySelector('ins').textContent.includes('新'));assert.deepEqual(buttons,['暂不更新','更新引文']);dom.window.close();
+ const modal=h.modals[0];modal.contentEl=dom.window.document.querySelector('main');modal.onOpen();assert.ok(modal.contentEl.querySelector('ins').textContent.includes('新'));assert.deepEqual(buttons,['打开来源','暂不更新','更新引文']);dom.window.close();
 });

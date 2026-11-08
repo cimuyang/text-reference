@@ -2,6 +2,8 @@
 const O = require("obsidian");
 const core = require("./core");
 const tracking = require("./source-tracking");
+const automatic = require("./automatic");
+const storage = require("./storage");
 const words = {
   send: ["引用到", "Reference to"],
   copy: ["复制引用", "Copy reference"],
@@ -89,6 +91,11 @@ class Confirm extends O.Modal {
       );
     } else
       this.contentEl.createEl("p", { text: this.text, cls: "tr-confirm-text" });
+    if (this.review?.openSource)
+      new O.Setting(this.contentEl).addButton((b) =>
+        b.setButtonText(this.p.zh ? "打开来源" : "Open source")
+          .onClick(() => this.p.run(() => this.review.openSource(() => this.close()))),
+      );
     this.errorEl = this.contentEl.createEl("p", { cls: "tr-inline-error" });
     this.errorEl.hidden = true;
     new O.Setting(this.contentEl)
@@ -159,23 +166,22 @@ class Confirm extends O.Modal {
   }
 }
 class Review extends O.Modal {
-  constructor(p, r, text) {
+  constructor(p, r, text, verified) {
     super(p.app);
     this.p = p;
     this.r = r;
     this.text = text;
+    this.verified = verified;
   }
   onOpen() {
     this.contentEl.createEl("p", { text: this.text });
+    this.contentEl.createEl("blockquote", { text: this.p.display(this.r) });
     new O.Setting(this.contentEl).addButton((b) =>
       b.setButtonText(this.p.zh ? "打开来源" : "Open source").onClick(() =>
-        this.p.run(async () => {
-          const opened = await this.p.open(this.r, false, true);
-          if (opened) {
-            this.close();
-            opened.view?.editor?.focus();
-          }
-        }),
+        this.p.run(() => this.p.open(this.r, false, {
+          verified: this.verified,
+          onOpened: () => this.close(),
+        })),
       ),
     );
   }
@@ -200,7 +206,9 @@ module.exports = class TextReference extends O.Plugin {
     this.Obsidian = O;
     this.fullQuotes = new Set();
     this.readingLinks = new Map();
+    this.readingBindings = new WeakMap();
     this.readingRoots = new Map();
+    this.automaticNotes = new Map();
     this.registerHoverLinkSource?.("text-reference", {
       display: "Text Reference",
       defaultMod: true,
@@ -218,20 +226,7 @@ module.exports = class TextReference extends O.Plugin {
         limit: data.limit ?? 30,
       }),
     };
-    this.refs = Array.isArray(data.refs)
-      ? data.refs.filter(
-          (r) =>
-            r &&
-            typeof r.token === "string" &&
-            r.token.length &&
-            typeof r.target === "string" &&
-            typeof r.source === "string" &&
-            typeof r.quote === "string" &&
-            typeof r.name === "string" &&
-            typeof r.prefix === "string" &&
-            typeof r.suffix === "string",
-        )
-      : [];
+    this.refs = storage.unpack(data);
     this.removedRefs = new Map();
     tracking.init(this);
     this.saving = Promise.resolve();
@@ -278,21 +273,25 @@ module.exports = class TextReference extends O.Plugin {
         )
           return;
         event.preventDefault();
-        const r = { ...this.pending.r },
-          token = this.token(r),
+        const { r, anchor } = this.pending,
+          token = this.pending.token,
           at = editor.posToOffset(editor.getCursor("from"));
         editor.replaceSelection(token);
-        require("./maintenance").register(
-          this,
-          core.bind(r, view.file.path, token, editor.getValue(), at),
-          editor.getValue(),
+        const record = this.registerReference(
+          r, view.file.path, token, editor.getValue(), at,
         );
-        this.refreshEditors();
+        if (anchor) this.sourceAnchors.set(record.id, { ...anchor });
+        if (this.settings.notifySourceChanges) tracking.schedule(this, record.source);
         this.run(() => this.save());
       }),
     );
     this.registerEvent(
+      this.app.vault.on("create", (file) => this.invalidateAutomatic(file.path)),
+    );
+    this.registerEvent(
       this.app.vault.on("rename", (file, old) => {
+        this.invalidateAutomatic(old);
+        this.invalidateAutomatic(file.path);
         tracking.invalidate(this, old);
         tracking.invalidate(this, file.path);
         clearTimeout(this.sourceTimers.get(old));
@@ -318,6 +317,7 @@ module.exports = class TextReference extends O.Plugin {
     );
     this.registerEvent(
       this.app.vault.on("delete", (file) => {
+        this.invalidateAutomatic(file.path);
         tracking.invalidate(this, file.path);
         for (const r of [...this.refs])
           if (r.target === file.path) {
@@ -341,6 +341,7 @@ module.exports = class TextReference extends O.Plugin {
     );
     this.registerEvent(
       this.app.vault.on("modify", (file) => {
+        this.invalidateAutomatic(file.path);
         tracking.invalidate(this, file.path);
         if (
           this.settings.notifySourceChanges &&
@@ -370,46 +371,19 @@ module.exports = class TextReference extends O.Plugin {
       this.pending = null;
     });
   }
+  referenceBindings(text, path, includeRepair) {
+    return automatic.bindings(this, text, path, includeRepair);
+  }
+  invalidateAutomatic(path) {
+    if (!automatic.invalidate(this, path)) return;
+    clearTimeout(this.automaticRefreshTimer);
+    this.automaticRefreshTimer = setTimeout(() => this.run(async () => {
+      await this.rebindReading();
+      this.refreshDisplays();
+    }), 50);
+  }
   async bindReading(el, ctx) {
     if (!el.querySelector("a.internal-link")) return;
-    const file = this.app.vault.getAbstractFileByPath(ctx.sourcePath);
-    if (!file) return;
-    const text = await tracking.read(this, file);
-    for (const a of el.querySelectorAll("a.internal-link")) {
-      if (this.readingLinks.has(a)) continue;
-      const source = this.app.metadataCache.getFirstLinkpathDest(
-        a.getAttribute("data-href"),
-        ctx.sourcePath,
-      );
-      for (const r of this.refs.filter((r) => r.target === ctx.sourcePath))
-        core.reconcile(text, r);
-      const candidates = this.refs.filter(
-        (r) =>
-          r.status !== "unused" &&
-          r.target === ctx.sourcePath &&
-          r.source === source?.path &&
-          core.binding(text, r) >= 0 &&
-          [
-            ...(r.repair ? [core.referenceText(r)] : []),
-            this.display(r),
-            (r.snapshot ?? r.quote).replace(/\r?\n/g, " "),
-          ].some((label) => a.textContent === label + "（" + r.name + "）"),
-      );
-      if (candidates.length !== 1) continue;
-      const r = candidates[0],
-        child = new O.MarkdownRenderChild(a),
-        original = a.textContent;
-      ctx.addChild(child);
-      if (!r.repair) this.paint(a, r);
-      const cleanup = require("./interaction").bind(this, a, r);
-      this.readingLinks.set(a, r);
-      child.register(() => {
-        cleanup();
-        this.readingLinks.delete(a);
-        a.textContent = original;
-        a.classList.remove("tr-reference", "tr-body");
-      });
-    }
     if (!this.readingRoots.has(el)) {
       this.readingRoots.set(el, ctx);
       const owner = new O.MarkdownRenderChild(el);
@@ -423,12 +397,108 @@ module.exports = class TextReference extends O.Plugin {
         this.readingRoots.delete(el);
       });
     }
+    const path = ctx.sourcePath;
+    const file = this.app.vault.getAbstractFileByPath(path);
+    if (!file) {
+      for (const a of el.querySelectorAll("a.internal-link"))
+        this.readingBindings.get(a)?.release();
+      return;
+    }
+    const text = await tracking.read(this, file);
+    if (!this.readingRoots.has(el)) return;
+    const bindings = this.referenceBindings(text, path, true);
+    const entry = this.automaticNotes.get(path);
+    const section = ctx.getSectionInfo?.(el);
+    let start = 0,
+      end = text.length;
+    if (section) {
+      const lines = entry.lineStarts ??= [0, ...Array.from(text.matchAll(/\n/g), (m) => m.index + 1)];
+      if (lines[section.lineStart] === undefined) return;
+      start = lines[section.lineStart];
+      end = lines[section.lineEnd + 1] ?? text.length;
+    }
+    const key = (source, label) => JSON.stringify([source, label]);
+    const groups = new Map();
+    for (const { r, at } of bindings) {
+      if (at < start || at + r.token.length > end) continue;
+      const id = key(r.source, core.visibleToken(r.token));
+      if (!groups.has(id))
+        groups.set(id, { refs: new Map(), anchors: [], tokens: new Set() });
+      const group = groups.get(id);
+      group.refs.set(at, r);
+      group.tokens.add(r.token);
+    }
+    const syntax = new Map();
+    for (const { at, token } of entry.links) {
+      if (at < start || at + token.length > end) continue;
+      if (!syntax.has(token)) syntax.set(token, []);
+      syntax.get(token).push(at);
+    }
+    const anchors = el.querySelectorAll("a.internal-link");
+    for (const a of anchors) {
+      const href = a.getAttribute("data-href");
+      if (!href) continue;
+      const source = this.app.metadataCache.getFirstLinkpathDest(href, path);
+      const label = this.readingBindings.get(a)?.label ?? a.textContent;
+      let group = groups.get(key(source?.path ?? href, label));
+      if (!group && !source && href.includes("%")) {
+        try {
+          group = groups.get(key(decodeURIComponent(href), label));
+        } catch {}
+      }
+      group?.anchors.push(a);
+    }
+    const desired = new Map();
+    for (const { refs, anchors, tokens } of groups.values()) {
+      // Use actual link syntax to keep code examples out of the DOM ordering.
+      const offsets = new Set(refs.keys());
+      for (const token of tokens)
+        for (const at of syntax.get(token) ?? []) offsets.add(at);
+      const positions = [...offsets];
+      if (positions.length !== anchors.length) continue;
+      positions.sort((a, b) => a - b);
+      anchors.forEach((a, i) => desired.set(a, refs.get(positions[i])));
+    }
+    for (const a of anchors) {
+      const r = desired.get(a);
+      const bound = this.readingBindings.get(a);
+      if (r && bound?.id === r.id && bound.source === r.source &&
+          bound.reviewId === r.reviewId && bound.repair === Boolean(r.repair)) continue;
+      if (a.trSelection?.()) continue;
+      bound?.release();
+      if (!r) continue;
+      const label = a.textContent;
+      const attributes = ["contenteditable", "draggable", "title"].map((name) =>
+        [name, a.getAttribute(name)],
+      );
+      const child = new O.MarkdownRenderChild(a);
+      const cleanup = require("./interaction").bind(this, a, r);
+      const release = () => {
+        if (this.readingBindings.get(a)?.release !== release) return;
+        cleanup();
+        this.readingBindings.delete(a);
+        this.readingLinks.delete(a);
+        a.textContent = label;
+        a.classList.remove("tr-reference", "tr-body");
+        delete a.trPaint;
+        for (const [name, value] of attributes)
+          if (value === null) a.removeAttribute(name);
+          else a.setAttribute(name, value);
+      };
+      this.readingBindings.set(a, {
+        id: r.id, source: r.source, reviewId: r.reviewId, repair: Boolean(r.repair), label, release,
+      });
+      this.readingLinks.set(a, r);
+      if (!r.repair) this.paint(a, r);
+      child.register(release);
+      ctx.addChild(child);
+    }
   }
   refreshDisplays() {
     this.refreshEditors();
     for (const [a, r] of this.readingLinks || [])
       if (a.isConnected && !a.trSelection?.()) {
-        const current = !r.target ? r : this.refs.find((x) => x.id === r.id);
+        const current = !r.target || r.automatic ? r : this.refs.find((x) => x.id === r.id);
         if (current && !current.repair) this.paint(a, current);
       }
   }
@@ -437,32 +507,27 @@ module.exports = class TextReference extends O.Plugin {
     this.persistTimer = setTimeout(() => this.run(() => this.persist()), 250);
   }
   onunload() {
+    this.previewClose?.(true);
     clearTimeout(this.persistTimer);
+    clearTimeout(this.automaticRefreshTimer);
+    for (const entry of this.automaticNotes.values()) clearTimeout(entry.timer);
+    this.automaticNotes.clear();
     this.trackingStopped = true;
     tracking.reset(this);
     this.persist();
   }
-  async save() {
+  async rebindReading() {
     for (const [el, ctx] of this.readingRoots)
       if (el.isConnected) await this.bindReading(el, ctx);
+  }
+  async save() {
+    await this.rebindReading();
     this.refreshDisplays();
     return this.persist();
   }
   persist() {
     tracking.prune(this);
-    const value = JSON.parse(
-      JSON.stringify({
-        schemaVersion: 3,
-        settings: this.settings,
-        refs: this.refs.map((r) => {
-          const out = { ...r };
-          delete out.limit;
-          delete out.layout;
-          if (out.snapshot === out.quote) delete out.snapshot;
-          return out;
-        }),
-      }),
-    );
+    const value = JSON.parse(JSON.stringify(storage.pack(this.settings, this.refs)));
     this.saving = this.saving.catch(() => {}).then(() => this.saveData(value));
     return this.saving;
   }
@@ -486,18 +551,32 @@ module.exports = class TextReference extends O.Plugin {
     return core.inlineLink(r.source, this.display(r), r.name);
   }
   display(r) {
-    return core.readable(r.snapshot ?? r.quote);
+    return r.automatic ? r.quote : core.readable(r.snapshot ?? r.quote);
   }
   refreshEditors() {
     for (const view of this.editorViews || [])
       view.dispatch({ effects: this.refreshEffect.of(null) });
   }
   async copy(editor, view) {
-    const r = this.selection(editor, view),
-      token = this.token(r);
+    const r = this.selection(editor, view);
+    const token = this.token(r);
     await navigator.clipboard.writeText(token);
     this.pending = { r, token };
     new O.Notice(this.t("copied"), 1500);
+  }
+  referenceClipboard(r) {
+    const { v, source, name, quote, snapshot, prefix, suffix, locator } = r;
+    return {
+      r: { v, source, name, quote, snapshot, prefix, suffix, locator },
+      token: r.token,
+      anchor: this.sourceAnchors.get(r.id),
+    };
+  }
+  registerReference(r, path, token, text, at) {
+    const record = core.bind(r, path, token, text, at);
+    require("./maintenance").register(this, record, text);
+    this.refreshEditors();
+    return record;
   }
   async send(editor, view) {
     const r = this.selection(editor, view);
@@ -515,9 +594,7 @@ module.exports = class TextReference extends O.Plugin {
           after = text + (text.endsWith("\n") ? "" : "\n") + token;
           return after;
         });
-        const record = core.bind(r, file.path, token, after, at);
-        require("./maintenance").register(this, record, after);
-        this.refreshEditors();
+        const record = this.registerReference(r, file.path, token, after, at);
         await this.save();
         const message = document.createDocumentFragment();
         message.append(this.t("done") + " ");
@@ -585,11 +662,12 @@ module.exports = class TextReference extends O.Plugin {
   }
   menu(r, event, a) {
     const menu = new O.Menu();
+    const review = r.reviewId ? this.refs.find((x) => x.id === r.reviewId) ?? r : r;
     menu.addItem((i) =>
       i
         .setTitle(this.zh ? "核对原文…" : "Review source…")
         .setIcon("scan-text")
-        .onClick(() => this.run(() => this.reviewSource(r))),
+        .onClick(() => this.run(() => this.reviewSource(review))),
     );
     menu.addItem((i) =>
       i
@@ -611,37 +689,48 @@ module.exports = class TextReference extends O.Plugin {
     );
     menu.showAtMouseEvent(event);
   }
-  async open(r, newTab, quiet = false) {
-    const file = this.app.vault.getAbstractFileByPath(r.source);
+  async open(r, newTab, { verified, onOpened } = {}) {
+    const file = tracking.sourceFile(this, r);
     if (!file) {
+      if (!onOpened && r.automatic && this.app.workspace.openLinkText)
+        return this.app.workspace.openLinkText(r.linkPath, r.target, newTab);
       new O.Notice(this.t("missing"));
       return;
     }
-    const found = await tracking.resolve(
-        this,
-        await tracking.read(this, file),
-        r,
-      ),
-      leaf =
+    if (r.automatic && file.path !== r.source) r = { ...r, source: file.path };
+    const workspace = this.app.workspace;
+    const leaf =
         (!newTab &&
-          this.app.workspace
+          workspace
             .getLeavesOfType?.("markdown")
             .find((l) => l.view?.file?.path === r.source)) ||
-        this.app.workspace.getLeaf(newTab ? "tab" : false);
-    await leaf.openFile(file, { state: { mode: "source" } });
-    if (!["found", "changed"].includes(found.status)) {
-      if (!quiet) new O.Notice(this.t("missing"));
-      return leaf;
+        workspace.getLeaf(newTab ? "tab" : false);
+    await leaf.openFile(file, { active: true, state: { mode: "source" } });
+    await leaf.loadIfDeferred?.();
+    onOpened?.();
+    await workspace.revealLeaf?.(leaf);
+    const view = leaf.view;
+    const editor = view instanceof O.MarkdownView && view.file?.path === file.path
+      ? view.editor : null;
+    if (editor) {
+      const text = editor.getValue();
+      const found = verified?.text === text ? verified : await tracking.resolve(this, text, r);
+      if (
+        leaf.view === view && view.file?.path === file.path && view.editor === editor &&
+        editor.getValue() === text && found.start !== undefined
+      ) {
+        const from = editor.offsetToPos(found.start);
+        const to = editor.offsetToPos(found.end);
+        editor.setSelection(from, to);
+        editor.scrollIntoView({ from, to }, true);
+        editor.focus();
+        return { leaf, located: true };
+      }
     }
-    if (leaf.view instanceof O.MarkdownView) {
-      const e = leaf.view.editor,
-        from = e.offsetToPos(found.start),
-        to = e.offsetToPos(found.end);
-      e.setSelection(from, to);
-      e.scrollIntoView({ from, to }, true);
-      e.focus();
-    }
-    return leaf;
+    new O.Notice(this.zh
+      ? "已打开来源，暂无法确定原句位置。"
+      : "Source opened, but the passage could not be located.");
+    return { leaf, located: false };
   }
   async change(r, fn) {
     const fail = () =>
@@ -734,12 +823,13 @@ module.exports = class TextReference extends O.Plugin {
     return tracking.check(this, file);
   }
   async reviewSource(r) {
-    if (!this.refs.includes(r)) throw Error(this.t("changed"));
-    const file = this.app.vault.getAbstractFileByPath(r.source);
+    if (!r.automatic && !this.refs.includes(r)) throw Error(this.t("changed"));
+    const file = tracking.sourceFile(this, r);
     if (!file) {
-      new O.Notice(this.t("missing"));
+      new Review(this, r, this.t("missing")).open();
       return;
     }
+    if (r.automatic && file.path !== r.source) r = { ...r, source: file.path };
     const text = await tracking.read(this, file);
     const draft = this.sourceDrafts.get(r.id);
     if (
@@ -752,11 +842,18 @@ module.exports = class TextReference extends O.Plugin {
     }
     const found = await tracking.resolve(this, text, r);
     if (found.status === "changed" || (r.repair && found.status === "found")) {
+      if (r.automatic) {
+        const saved = await automatic.promote(this, r, text, found);
+        if (!saved) throw Error(this.t("changed"));
+        r = saved;
+      }
       await this.confirmReference(
         r,
         {
           source: r.source,
           text,
+          start: found.start,
+          end: found.end,
           quote: text.slice(found.start, found.end),
           prefix: text.slice(Math.max(0, found.start - 64), found.start),
           suffix: text.slice(found.end, found.end + 64),
@@ -775,9 +872,11 @@ module.exports = class TextReference extends O.Plugin {
         : this.zh
           ? "暂时无法确定原文范围，已保留摘录。需要更换时，请重新复制引用。"
           : "Cannot determine passage. Snapshot preserved. Copy a new reference to replace it.",
+      found.start === undefined ? undefined : { ...found, text },
     ).open();
   }
   async confirmReference(r, selected, mode = "update") {
+    const expected = { ...r };
     const file = this.app.vault.getAbstractFileByPath(r.source);
     if (!file || selected.source !== r.source) throw Error(this.t("changed"));
     const sourceText = await tracking.read(this, file);
@@ -787,7 +886,15 @@ module.exports = class TextReference extends O.Plugin {
         : core.locate(sourceText, selected).status !== "found"
     )
       throw Error(this.t("changed"));
-    const expected = { ...r };
+    if (Number.isInteger(selected.start) && Number.isInteger(selected.end) &&
+        sourceText.slice(selected.start, selected.end) === selected.quote) {
+      selected = { ...selected, locator: {
+        source: r.source,
+        start: selected.start,
+        end: selected.end,
+        hash: await tracking.fingerprint(sourceText),
+      } };
+    }
     new Confirm(
       this,
       (this.zh
@@ -852,6 +959,10 @@ module.exports = class TextReference extends O.Plugin {
       {
         old: r.repair ? core.referenceText(r) : (r.snapshot ?? r.quote),
         next: selected.quote,
+        openSource: (onOpened) => this.open(r, false, {
+          verified: selected.locator ? { ...selected.locator, text: sourceText } : undefined,
+          onOpened,
+        }),
       },
     ).open();
   }
@@ -912,28 +1023,15 @@ module.exports = class TextReference extends O.Plugin {
     new O.Notice(this.t("done"));
   }
   installEditor() {
-    require("./editor").install(this, O, core);
+    require("./editor").install(this, O);
   }
   async onExternalSettingsChange() {
     await this.saving;
     const data = await this.loadData();
     if (!data || !Array.isArray(data.refs)) return;
-    this.refs = data.refs.filter(
-      (r) =>
-        r &&
-        typeof r.id === "string" &&
-        !this.removedRefs.has(r.id) &&
-        [
-          "token",
-          "source",
-          "target",
-          "quote",
-          "name",
-          "prefix",
-          "suffix",
-        ].every((k) => typeof r[k] === "string"),
-    );
+    this.refs = storage.unpack(data).filter((r) => !this.removedRefs.has(r.id));
     tracking.reset(this);
+    await this.rebindReading();
     this.refreshDisplays();
     if (this.settings.notifySourceChanges) await tracking.checkAll(this);
   }
@@ -996,8 +1094,8 @@ class Settings extends O.PluginSettingTab {
     e.createEl("p", {
       cls: "tr-help",
       text: p.zh
-        ? "选中文字，右键复制引用后粘贴；或用引用到直接添加。\nCtrl（Mac 用 Cmd）＋悬停预览上下文；单击跳转，拖动选字。\n右键引文→核对原文，对比后确认更新。\n显示设置即时应用于已有引用。来源笔记保持不变；跨设备请同步插件数据。"
-        : "Select text, copy a reference and paste; or use Reference to.\nCtrl/Cmd + hover previews context; click navigates; drag selects text.\nRight-click a reference → Review source to compare and update.\nDisplay settings apply to existing references. Source notes stay untouched; sync plugin data across devices.",
+        ? "选中文字，右键复制引用后粘贴；或用引用到直接添加。\n输入或粘贴 [[笔记|引文（笔记）]] 会自动应用引用样式。\nCtrl（Mac 用 Cmd）＋悬停预览上下文；单击跳转，拖动选字。\n右键引文→核对原文，对比后确认更新。\n显示设置即时应用于已有引用。来源笔记保持不变；跨设备请同步插件数据。"
+        : "Select text, copy a reference and paste; or use Reference to.\nTyping or pasting [[Note|Passage (Note)]] applies reference styling automatically.\nCtrl/Cmd + hover previews context; click navigates; drag selects text.\nRight-click a reference → Review source to compare and update.\nDisplay settings apply to existing references. Source notes stay untouched; sync plugin data across devices.",
     });
     new O.Setting(e)
       .setName(p.zh ? "复制引用快捷键" : "Copy reference shortcut")
@@ -1022,7 +1120,7 @@ class Settings extends O.PluginSettingTab {
             tracking.reset(p);
             p.refreshDisplays();
             p.run(async () => {
-              await p.persist();
+              await p.save();
               if (value) await tracking.checkAll(p, true);
             });
           }),

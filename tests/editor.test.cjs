@@ -153,7 +153,25 @@ test("real CodeMirror: paste immediately overrides native hiding, selection reve
       "drag selection must keep visible DOM stable",
     );
     selection.removeAllRanges();
+    const copied = "[[日志.md|旧摘录即使无法定位也显示（日志）]]";
+    const at = view.state.doc.length;
+    view.dispatch({
+      changes: { from: at, insert: "\n" + copied },
+      selection: { anchor: at + copied.length + 1 },
+      userEvent: "input.paste",
+    });
+    assert.equal(view.dom.querySelectorAll(".tr-reference").length, 1);
+    assert.ok(view.dom.textContent.includes(copied));
+    const end = view.state.doc.length;
+    view.dispatch({ selection: { anchor: end, head: at + 1 } });
+    assert.equal(view.state.sliceDoc(view.state.selection.main.from, view.state.selection.main.to), copied);
+    assert.ok(view.dom.textContent.includes(copied));
+    view.dispatch({ selection: { anchor: 0 } });
+    assert.equal(view.dom.querySelectorAll(".tr-reference").length, 2);
+    assert.ok(view.dom.textContent.includes("旧摘…（日志）"));
+    assert.equal(h.p.refs.length, 1);
     await h.p.saving;
+    h.p.onunload();
   } finally {
     view?.destroy();
     dom.window.close();

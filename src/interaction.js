@@ -5,8 +5,13 @@ function bind(p, a, r) {
   let down = null,
     moved = false,
     held = false;
-  const parent = { hoverPopover: null };
-  const current = () => p.refs.find((x) => x.id === r.id);
+  const current = () => r.automatic ? r : p.refs.find((x) => x.id === r.id);
+  const open = (e) => {
+    const reference = current();
+    if (!reference) return;
+    const newTab = e.ctrlKey || e.metaKey;
+    p.run(() => p.open(reference, newTab));
+  };
   a.removeAttribute("title");
   a.draggable = false;
   a.setAttribute("contenteditable", "false");
@@ -60,12 +65,12 @@ function bind(p, a, r) {
         moved = false;
         return;
       }
-      if (current()) p.run(() => p.open(current(), e.ctrlKey || e.metaKey));
+      open(e);
     }),
     on(a, "keydown", (e) => {
       if (e.key === "Enter") {
         e.preventDefault();
-        if (current()) p.run(() => p.open(current(), e.ctrlKey || e.metaKey));
+        open(e);
       }
     }),
     on(a, "contextmenu", (e) => {
@@ -79,9 +84,17 @@ function bind(p, a, r) {
       "copy",
       (e) => {
         if (!ownsSelection()) return;
-        const text = win.getSelection().toString();
+        const selection = win.getSelection();
+        const text = selection.toString();
+        const reference = current();
+        const whole = text === a.textContent;
+        if (!whole && !(a.contains(selection.anchorNode) && a.contains(selection.focusNode)))
+          return;
         if (text && e.clipboardData) {
-          e.clipboardData.setData("text/plain", text);
+          p.pending = whole && reference && !reference.automatic && !reference.repair
+            ? p.referenceClipboard?.(reference) ?? null
+            : null;
+          e.clipboardData.setData("text/plain", whole && reference?.token ? reference.token : text);
           e.preventDefault();
           e.stopImmediatePropagation();
           return false;
@@ -90,12 +103,14 @@ function bind(p, a, r) {
       true,
     ),
   ];
-  const removeHover = require("./hover").install(p, a, r, parent);
+  const removeHover = require("./hover").install(p, a, r);
+  a.trDragging = () => Boolean(down);
   a.trSelection = () => Boolean(down) || ownsSelection();
   return () => {
     pointerOff();
     removeHover();
     for (const off of listeners) off();
+    delete a.trDragging;
     delete a.trSelection;
   };
 }

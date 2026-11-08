@@ -1,183 +1,196 @@
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
 const { JSDOM } = require("jsdom");
-const core = require("../src/core");
+const tracking = require("../src/source-tracking");
 const { install } = require("../src/hover");
-function setup(native, enabled) {
-  const dom = new JSDOM("<a>引用</a>"),
-    doc = dom.window.document,
-    a = doc.querySelector("a");
-  const calls = [],
-    popups = [],
-    renders = [];
-  const r = {
-    source: "来源.md",
-    target: "目标.md",
-    quote: "原句",
-    prefix: "",
-    suffix: "",
-  };
+
+function setup() {
+  const dom = new JSDOM("<a>引用</a>");
+  const doc = dom.window.document;
+  const anchor = doc.querySelector("a");
+  const calls = [];
+  const r = { source: "来源.md", target: "目标.md", quote: "原句", prefix: "", suffix: "" };
   const p = {
-    core,
     run: (fn) => Promise.resolve().then(fn),
-    t: (x) => x,
-    Obsidian: {
-      Notice: class {},
-      HoverPopover: class {
-        constructor(parent) {
-          this.state = 1;
-          this.hoverEl = doc.createElement("div");
-          this.hoverEl.createDiv = ({ cls }) => {
-            const el = doc.createElement("div");
-            el.className = cls;
-            this.hoverEl.appendChild(el);
-            return el;
-          };
-          doc.body.appendChild(this.hoverEl);
-          parent.hoverPopover = this;
-          popups.push(this);
-        }
-        unload() {
-          this.state = 3;
-          this.hoverEl.remove();
-        }
-      },
-      MarkdownRenderer: {
-        render: async (app, text, el) => {
-          el.textContent = text;
-          renders.push(text);
-        },
-      },
-    },
     app: {
-      internalPlugins: { getPluginById: () => ({ enabled }) },
       vault: {
-        getAbstractFileByPath: () => ({}),
+        getAbstractFileByPath: () => ({ path: r.source }),
         read: async () => "上文\n原句\n下文",
       },
-      workspace: {
-        trigger: (event, data) => {
-          calls.push(data);
-          if (native) data.hoverParent.hoverPopover = { state: 1, unload() {} };
-        },
-      },
+      workspace: { trigger: (event, data) => calls.push(data) },
     },
   };
-  const dispose = install(p, a, r, {});
-  return { dom, doc, a, calls, popups, renders, dispose, p, r };
+  const dispose = install(p, anchor, r, {});
+  const move = (ctrlKey = true) =>
+    anchor.dispatchEvent(new dom.window.MouseEvent("mouseover", { ctrlKey, clientX: 23 }));
+  const key = (type, ctrlKey) =>
+    doc.dispatchEvent(new dom.window.KeyboardEvent(type, { key: "Control", ctrlKey }));
+  return { dom, doc, anchor, calls, p, r, move, key, close() { dispose(); dom.window.close(); } };
 }
-test("pointer already hovering then Control pressed opens one native request", async () => {
-  const h = setup(true);
-  h.a.dispatchEvent(
-    new h.dom.window.MouseEvent("mouseover", { bubbles: true }),
-  );
-  h.doc.dispatchEvent(
-    new h.dom.window.KeyboardEvent("keydown", {
-      key: "Control",
-      ctrlKey: true,
-      bubbles: true,
-    }),
-  );
-  await new Promise(setImmediate);
-  assert.equal(h.calls.length, 1);
-  assert.equal(h.calls[0].event.ctrlKey, true);
-  assert.equal(h.calls[0].state.scroll, 1);
-  h.a.dispatchEvent(
-    new h.dom.window.MouseEvent("mousemove", { ctrlKey: true }),
-  );
-  await new Promise(setImmediate);
-  assert.equal(h.calls.length, 1);
-  h.dispose();
-  h.dom.window.close();
-});
-test("native preview not created: native container fallback renders passage context once", async () => {
-  const h = setup(false);
-  h.a.dispatchEvent(
-    new h.dom.window.MouseEvent("mouseover", { ctrlKey: true, bubbles: true }),
-  );
-  await new Promise((r) => setTimeout(r, 550));
-  assert.equal(h.popups.length, 1);
-  assert.ok(h.renders[0].includes("上文\n原句\n下文"));
-  h.a.dispatchEvent(
-    new h.dom.window.MouseEvent("mousemove", { ctrlKey: true }),
-  );
-  await new Promise(setImmediate);
-  assert.equal(h.calls.length, 1);
-  h.dispose();
-  assert.equal(h.doc.querySelector(".tr-context-preview"), null);
-  h.dom.window.close();
-});
-test("leaving link cancels delayed preview", async () => {
-  const h = setup(false);
-  h.a.dispatchEvent(
-    new h.dom.window.MouseEvent("mouseover", { ctrlKey: true }),
-  );
-  await new Promise(setImmediate);
-  h.a.dispatchEvent(
-    new h.dom.window.MouseEvent("mouseout", { relatedTarget: h.doc.body }),
-  );
-  await new Promise((r) => setTimeout(r, 550));
-  assert.equal(h.popups.length, 0);
-  h.dispose();
-  h.dom.window.close();
-});
 
-test("enabled core preview never races a second fallback popup", async () => {
-  const h = setup(false, true);
+function publish(h, request, nativeHide = true) {
+  const hoverEl = h.doc.createElement("div");
+  hoverEl.className = "hover-popover";
+  hoverEl.textContent = "原文上下文";
+  h.doc.body.appendChild(hoverEl);
+  const popup = {
+    hoverEl,
+    hidden: 0,
+    unload() { hoverEl.textContent = ""; },
+  };
+  if (nativeHide)
+    popup.hide = () => {
+      popup.hidden++;
+      hoverEl.remove();
+      request.hoverParent.hoverPopover = null;
+    };
+  request.hoverParent.hoverPopover = popup;
+  return popup;
+}
+
+test("leaving a shown reference leaves closing and animation to Obsidian", async () => {
+  const h = setup();
   try {
-    h.a.dispatchEvent(
-      new h.dom.window.MouseEvent("mouseover", { ctrlKey: true }),
-    );
-    await new Promise((resolve) => setTimeout(resolve, 550));
-    assert.equal(h.calls.length, 1);
-    assert.equal(h.popups.length, 0);
+    h.move();
+    await new Promise(setImmediate);
+    const popup = publish(h, h.calls[0]);
+    h.anchor.dispatchEvent(new h.dom.window.MouseEvent("mouseout", {
+      ctrlKey: true, relatedTarget: h.doc.body,
+    }));
+    assert.equal(popup.hidden, 0);
+    assert.ok(popup.hoverEl.isConnected);
+    popup.hide();
+    assert.equal(popup.hidden, 1);
+    assert.equal(h.doc.querySelector(".hover-popover"), null);
+    assert.equal(h.p.previewClose, null);
   } finally {
-    h.dispose();
-    h.dom.window.close();
+    h.close();
   }
 });
 
-test("disabled core preview uses one fallback without triggering native preview", async () => {
-  const h = setup(false, false);
+test("entering a native popup and releasing Ctrl do not forcibly unload it", async () => {
+  const h = setup();
   try {
-    h.a.dispatchEvent(
-      new h.dom.window.MouseEvent("mouseover", { ctrlKey: true }),
-    );
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    assert.equal(h.calls.length, 0);
-    assert.equal(h.popups.length, 1);
-    assert.equal(h.renders.length, 1);
+    h.move();
+    await new Promise(setImmediate);
+    const popup = publish(h, h.calls[0]);
+    h.anchor.dispatchEvent(new h.dom.window.MouseEvent("mouseout", {
+      ctrlKey: true, relatedTarget: popup.hoverEl,
+    }));
+    popup.hoverEl.dispatchEvent(new h.dom.window.MouseEvent("mouseenter", { ctrlKey: true }));
+    h.key("keyup", false);
+    assert.equal(popup.hoverEl.textContent, "原文上下文");
+    popup.hoverEl.dispatchEvent(new h.dom.window.MouseEvent("mouseleave", {
+      ctrlKey: true, relatedTarget: h.doc.body,
+    }));
+    assert.equal(popup.hidden, 0);
+    popup.hide();
+    assert.equal(h.doc.querySelector(".hover-popover"), null);
   } finally {
-    h.dispose();
-    h.dom.window.close();
+    h.close();
   }
 });
 
-test("hover ignores a source result invalidated while its read is pending", async () => {
-  const h = setup(false, true);
-  let release;
-  h.p.app.vault.read = () =>
-    new Promise((resolve) => {
-      release = resolve;
-    });
+test("a late native popup cannot replace or close a newer reference preview", async () => {
+  const h = setup();
+  const other = h.doc.createElement("a");
+  h.doc.body.appendChild(other);
+  const dispose = install(h.p, other, h.r);
   try {
-    h.a.dispatchEvent(
-      new h.dom.window.MouseEvent("mouseover", { ctrlKey: true }),
-    );
+    h.move();
     await new Promise(setImmediate);
-    require("../src/source-tracking").invalidate(h.p, h.r.source);
-    release("上文\n原句\n下文");
+    h.anchor.dispatchEvent(new h.dom.window.MouseEvent("mouseout", {
+      ctrlKey: true, relatedTarget: other,
+    }));
+    other.dispatchEvent(new h.dom.window.MouseEvent("mouseover", { ctrlKey: true }));
     await new Promise(setImmediate);
-    assert.equal(h.calls.length, 0);
-    assert.equal(h.popups.length, 0);
-    h.p.app.vault.read = async () => "新上文\n原句\n新下文";
-    h.a.dispatchEvent(
-      new h.dom.window.MouseEvent("mousemove", { ctrlKey: true }),
-    );
+    const current = publish(h, h.calls[1]);
+    const old = publish(h, h.calls[0]);
+    await new Promise(setImmediate);
+    assert.equal(old.hoverEl.isConnected, false);
+    assert.equal(current.hoverEl.isConnected, true);
+    h.key("keyup", false);
+    assert.equal(current.hoverEl.isConnected, true);
+    current.hide();
+  } finally {
+    dispose();
+    h.close();
+  }
+});
+
+test("disposing a reference removes its popup shell even if unload only clears contents", async () => {
+  const h = setup();
+  h.move();
+  await new Promise(setImmediate);
+  const popup = publish(h, h.calls[0], false);
+  h.close();
+  assert.equal(popup.hoverEl.isConnected, false);
+});
+
+test("holding Ctrl before entering a reference sends one native request with passage coordinates", async () => {
+  const h = setup();
+  try {
+    h.move();
+    h.move();
     await new Promise(setImmediate);
     assert.equal(h.calls.length, 1);
+    assert.deepEqual(h.calls[0].state.startLoc, { line: 1, col: 0 });
+    assert.deepEqual(h.calls[0].state.endLoc, { line: 1, col: 2 });
   } finally {
-    h.dispose();
-    h.dom.window.close();
+    h.close();
+  }
+});
+
+test("pressing Ctrl with a stationary pointer gives native preview a modified mouse event", async () => {
+  const h = setup();
+  try {
+    h.move(false);
+    h.key("keydown", true);
+    await new Promise(setImmediate);
+    assert.equal(h.calls.length, 1);
+    assert.ok(h.calls[0].event instanceof h.dom.window.MouseEvent);
+    assert.equal(h.calls[0].event.ctrlKey, true);
+    assert.equal(h.calls[0].event.clientX, 23);
+  } finally {
+    h.close();
+  }
+});
+
+test("leaving before the read completes cancels a native preview request", async () => {
+  const h = setup();
+  let finish;
+  h.p.app.vault.read = () => new Promise((resolve) => { finish = resolve; });
+  try {
+    h.move();
+    await new Promise(setImmediate);
+    h.anchor.dispatchEvent(new h.dom.window.MouseEvent("mouseout", { relatedTarget: h.doc.body }));
+    finish("上文\n原句\n下文");
+    await new Promise(setImmediate);
+    assert.equal(h.calls.length, 0);
+  } finally {
+    h.close();
+  }
+});
+
+test("repeated native previews reuse the source read until invalidated", async () => {
+  const h = setup();
+  const source = "前文填充\n".repeat(30000) + "原句\n";
+  let reads = 0;
+  h.p.app.vault.read = async () => { reads++; return source; };
+  try {
+    h.move();
+    await new Promise(setImmediate);
+    assert.equal(h.calls[0].state.startLoc.line, 30000);
+    h.key("keyup", false);
+    h.move();
+    await new Promise(setImmediate);
+    assert.equal(reads, 1);
+    h.key("keyup", false);
+    tracking.invalidate(h.p, h.r.source);
+    h.move();
+    await new Promise(setImmediate);
+    assert.equal(reads, 2);
+  } finally {
+    h.close();
   }
 });

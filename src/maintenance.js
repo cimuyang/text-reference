@@ -96,9 +96,8 @@ function transaction(p, tr, path) {
   if (changed) p.schedulePersist();
 }
 function register(p, r, text) {
-  const at = core.binding(text, r);
   for (const old of [...p.refs])
-    if (old.target === r.target && core.binding(text, old) === at)
+    if (old.target === r.target && core.binding(text, old) === r.at)
       retire(p, old);
   r.updatedAt = Date.now();
   p.refs.push(r);

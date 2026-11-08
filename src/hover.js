@@ -1,200 +1,146 @@
 "use strict";
 const tracking = require("./source-tracking");
-const preview = require("./preview-range");
-function install(p, a, r, parent) {
-  const doc = a.ownerDocument;
-  let inside = false,
-    mod = false,
-    version = 0,
-    busy = false,
-    requested = false,
-    timer = null;
-  let stopHighlight = () => {},
-    watchTimer = null;
-  const current = () => (p.refs ? p.refs.find((x) => x.id === r.id) : r);
-  const listen = (target, type, fn) => {
-    if (target === doc)
-      return require("./document-events").listen(doc, type, fn);
-    target.addEventListener(type, fn);
-    return () => target.removeEventListener(type, fn);
+const { listen } = require("./document-events");
+
+function position(text, offset) {
+  const prefix = text.slice(0, offset);
+  return { line: prefix.split("\n").length - 1, col: offset - prefix.lastIndexOf("\n") - 1 };
+}
+
+function closePopover(popover) {
+  if (!popover) return;
+  try {
+    if (typeof popover.hide === "function") popover.hide();
+    else popover.unload?.();
+  } finally {
+    popover.hoverEl?.remove();
+  }
+}
+
+function install(p, anchor, r) {
+  const doc = anchor.ownerDocument;
+  const win = doc.defaultView;
+  const current = () => r.automatic || !p.refs ? r : p.refs.find((x) => x.id === r.id);
+  let pointer = null, pending = false, generation = 0;
+  let releaseSource, visiblePopup;
+  const contains = (element, target) => Boolean(target?.nodeType && element?.contains(target));
+  const blur = () => {
+    pointer = null;
+    cancel();
   };
-  const live = () => parent.hoverPopover && parent.hoverPopover.state !== 3;
+  function cancel(dispose = false) {
+    generation++;
+    pending = false;
+    if (p.previewClose === cancel) p.previewClose = null;
+    win.removeEventListener("blur", blur);
+    releaseSource?.();
+    releaseSource = undefined;
+    if (dispose) {
+      const popup = visiblePopup;
+      visiblePopup = undefined;
+      closePopover(popup);
+    }
+  }
+
+  function popupOwner(turn) {
+    let popup;
+    return {
+      get hoverPopover() { return popup ?? null; },
+      set hoverPopover(next) {
+        if (next === popup) return;
+        if (visiblePopup === popup) visiblePopup = undefined;
+        popup = next;
+        if (turn !== generation) {
+          // Native preview publishes from inside show(). Let it finish first.
+          if (next) queueMicrotask(() => closePopover(next));
+          return;
+        }
+        visiblePopup = next ?? undefined;
+      },
+    };
+  }
+
   function request(event) {
-    if (!inside || !mod || busy || requested || live() || a.trSelection?.())
-      return;
-    const turn = ++version;
-    busy = true;
-    requested = true;
+    if (!pointer || pending || visiblePopup?.hoverEl?.isConnected || anchor.trDragging?.()) return;
+    p.previewClose?.();
+    p.previewClose = cancel;
+    pending = true;
+    win.addEventListener("blur", blur, { once: true });
+    const turn = ++generation;
     p.run(async () => {
-      try {
-        const reference = current();
-        if (!reference) return;
-        const stamp = JSON.stringify([
-          reference.source,
-          reference.quote,
-          reference.snapshot,
-          reference.locator,
-        ]);
-        const epoch = p.sourceEpochs?.get(reference.source) || 0;
-        const file = p.app.vault.getAbstractFileByPath(reference.source);
-        if (!file) {
-          // Hover does not emit global warnings.
-          return;
-        }
-        const text = await tracking.read(p, file),
-          found = await tracking.resolve(p, text, reference);
-        if (turn !== version || !inside || !mod || !a.isConnected) return;
-        const latest = current();
-        if (
-          !latest ||
-          stamp !==
-            JSON.stringify([
-              latest.source,
-              latest.quote,
-              latest.snapshot,
-              latest.locator,
-            ]) ||
-          epoch !== (p.sourceEpochs?.get(reference.source) || 0)
-        ) {
-          requested = false;
-          return;
-        }
-        if (!["found", "changed"].includes(found.status)) {
-          // Hover does not emit global warnings.
-          return;
-        }
-        let attempts = 0;
-        const watchNative = () => {
-          if (turn !== version || !inside || !mod || !a.isConnected) return;
-          if (parent.hoverPopover?.hoverEl) {
-            stopHighlight();
-            stopHighlight = preview.watch(p, parent.hoverPopover, text, found);
-            return;
-          }
-          if (++attempts < 40) watchTimer = setTimeout(watchNative, 40);
-        };
-        const position = (offset) => {
-          const prefix = text.slice(0, offset),
-            line = prefix.split("\n").length - 1;
-          return { line, col: offset - (prefix.lastIndexOf("\n") + 1) };
-        };
-        const line = text.slice(0, found.start).split("\n").length - 1;
-        const previewEnabled =
-          p.app.internalPlugins?.getPluginById?.("page-preview")?.enabled;
-        if (previewEnabled !== false)
-          p.app.workspace.trigger("hover-link", {
-            event,
-            source: "text-reference",
-            hoverParent: parent,
-            targetEl: a,
-            linktext: reference.source,
-            sourcePath: reference.target,
-            state: {
-              scroll: line,
-              startLoc: position(found.start),
-              endLoc: position(found.end),
-            },
-          });
-        watchNative();
-        // Core preview may be disabled or reject a stale event. Keep one native container as a fallback.
-        timer =
-          previewEnabled === true
-            ? null
-            : setTimeout(
-                () => {
-                  if (
-                    turn !== version ||
-                    !inside ||
-                    !mod ||
-                    !a.isConnected ||
-                    live() ||
-                    !p.Obsidian.HoverPopover
-                  )
-                    return;
-                  const popover = new p.Obsidian.HoverPopover(parent, a, 100);
-                  parent.hoverPopover = popover;
-                  const body = popover.hoverEl.createDiv({
-                    cls: "markdown-rendered tr-context-preview",
-                  });
-                  clearTimeout(watchTimer);
-                  const context = preview.context(text, found);
-                  p.run(async () => {
-                    await p.Obsidian.MarkdownRenderer.render(
-                      p.app,
-                      context.text,
-                      body,
-                      reference.source,
-                      popover,
-                    );
-                    if (
-                      turn !== version ||
-                      !inside ||
-                      !mod ||
-                      popover.state === 3
-                    )
-                      return;
-                    stopHighlight();
-                    stopHighlight = preview.watch(
-                      p,
-                      popover,
-                      context.text,
-                      context.range,
-                    );
-                  });
-                },
-                previewEnabled === false ? 0 : 500,
-              );
-      } finally {
-        busy = false;
+      if (turn !== generation) return;
+      const reference = current();
+      const file = reference && tracking.sourceFile(p, reference);
+      if (!file) {
+        cancel();
+        return;
       }
+      const source = file.path ?? reference.source;
+      const entry = tracking.previewSource(p, file, source);
+      entry.users++;
+      releaseSource = entry.release;
+      let text, found;
+      try {
+        text = await entry.text;
+        if (turn !== generation) return;
+        const latest = current();
+        if (latest && latest.source === reference.source) {
+          const key = JSON.stringify([latest.id, latest.quote, latest.prefix, latest.suffix, latest.locator]);
+          found = await tracking.previewRange(p, entry, text, { ...latest, source }, key);
+        }
+      } catch {
+        // The source can still be opened in native preview without a passage range.
+      }
+      if (turn !== generation) return;
+      const latest = current();
+      if (!anchor.isConnected || !latest || latest.source !== reference.source) {
+        cancel();
+        return;
+      }
+      const startLoc = entry.current() && latest.quote === reference.quote && found?.start !== undefined
+        ? position(text, found.start)
+        : undefined;
+      p.app.workspace.trigger("hover-link", {
+        event, source: "text-reference", hoverParent: popupOwner(turn), targetEl: anchor,
+        linktext: source, sourcePath: latest.target,
+        state: startLoc ? { scroll: startLoc.line, startLoc, endLoc: position(text, found.end) } : undefined,
+      });
     });
   }
-  const enter = (e) => {
-    inside = true;
-    mod = e.ctrlKey || e.metaKey;
-    e.stopPropagation();
-    request(e);
+
+  const move = (event) => {
+    pointer = event;
+    event.stopPropagation();
+    if (event.ctrlKey || event.metaKey) request(event);
   };
-  const offs = [
-    listen(a, "mouseover", enter),
-    listen(a, "mousemove", enter),
-    listen(a, "mouseout", (e) => {
-      if (a.contains(e.relatedTarget)) return;
-      inside = false;
-      requested = false;
-      version++;
-      busy = false;
-      clearTimeout(timer);
-      clearTimeout(watchTimer);
-      e.stopPropagation();
-    }),
-    listen(doc, "keydown", (e) => {
-      if (
-        !inside ||
-        !(e.key === "Control" || e.key === "Meta" || e.ctrlKey || e.metaKey)
-      )
-        return;
-      mod = true;
-      request(e);
-    }),
-    listen(doc, "keyup", (e) => {
-      mod = e.ctrlKey || e.metaKey;
-      if (!mod) {
-        requested = false;
-        version++;
-        busy = false;
-        clearTimeout(timer);
-        clearTimeout(watchTimer);
-      }
-    }),
-  ];
+  const leave = (event) => {
+    if (contains(anchor, event.relatedTarget)) return;
+    pointer = null;
+    // A published popup follows Obsidian's native transition and hover timing.
+    cancel();
+  };
+  anchor.addEventListener("mouseover", move);
+  anchor.addEventListener("mousemove", move);
+  anchor.addEventListener("mouseout", leave);
+  const offDown = listen(doc, "keydown", (event) => {
+    if (!pointer || !(event.ctrlKey || event.metaKey || event.key === "Control" || event.key === "Meta"))
+      return;
+    request(new doc.defaultView.MouseEvent("mouseover", {
+      clientX: pointer.clientX, clientY: pointer.clientY,
+      ctrlKey: event.ctrlKey || event.key === "Control",
+      metaKey: event.metaKey || event.key === "Meta",
+    }));
+  }, true);
+  const offUp = listen(doc, "keyup", (event) => {
+    if (!event.ctrlKey && !event.metaKey && p.previewClose === cancel) cancel();
+  }, true);
   return () => {
-    version++;
-    clearTimeout(timer);
-    clearTimeout(watchTimer);
-    for (const off of offs) off();
-    stopHighlight();
-    parent.hoverPopover?.unload();
+    cancel(true);
+    offDown();
+    offUp();
+    anchor.removeEventListener("mouseover", move);
+    anchor.removeEventListener("mousemove", move);
+    anchor.removeEventListener("mouseout", leave);
   };
 }
 module.exports = { install };
